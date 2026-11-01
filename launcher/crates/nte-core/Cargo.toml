@@ -9,6 +9,7 @@ description = "Core library for the native Linux launcher of Neverness To Everne
 libc = "0.2"
 anyhow.workspace = true
 md-5.workspace = true
+sha2.workspace = true
 ureq.workspace = true
 zip.workspace = true
 serde.workspace = true

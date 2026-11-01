@@ -183,7 +183,7 @@ jobs:
           test -f dist/SHA256SUMS
           (cd dist && sha256sum -c SHA256SUMS)
           count="$(find dist -maxdepth 1 -type f | wc -l)"
-          if [[ "$count" -lt 6 ]]; then
+          if [[ "$count" -lt 7 ]]; then
             echo "::error::构建产物不完整"
             exit 1
           fi

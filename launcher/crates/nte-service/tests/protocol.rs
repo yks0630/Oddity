@@ -64,6 +64,9 @@ fn persistent_stdio_roundtrip_errors_events_and_shutdown() {
     assert!(call("save_settings", json!({"settings":settings}))
         .get("result")
         .is_some());
+    assert!(call("integrity_acknowledge", json!({"notice":"success"}))
+        .get("result")
+        .is_some());
     for command in [
         "attendance_login",
         "attendance_send_code",
@@ -85,6 +88,7 @@ fn persistent_stdio_roundtrip_errors_events_and_shutdown() {
         "check_update",
         "fetch_bulletins",
         "save_settings",
+        "integrity_acknowledge",
         "open_url",
         "open_directory",
         "playtime_export_poster",

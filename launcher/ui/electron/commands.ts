@@ -18,6 +18,7 @@ export const commands = {
   attendance_keyring_check: true,
   launcher_background: true,
   bootstrap: true,
+  integrity_acknowledge: true,
   check_update: true,
   fetch_bulletins: true,
   save_settings: true,

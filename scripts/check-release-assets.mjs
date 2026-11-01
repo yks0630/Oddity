@@ -86,6 +86,51 @@ function verifyChecksums(directory, files) {
   check(entries.size === files.length, "SHA256SUMS 包含未发布的文件");
 }
 
+function verifyAppManifest(root, label, releaseManifest) {
+  const rootReal = realpathSync(root);
+  const text = readFileSync(join(root, "FILES.sha256"), "utf8");
+  check(
+    text === releaseManifest,
+    `${label}: 包内 FILES.sha256 与发布资产不一致`,
+  );
+  const entries = [];
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    const match = /^([0-9a-f]{64})  (.+)$/.exec(line);
+    check(match, `${label}: FILES.sha256 行格式错误: ${line}`);
+    if (match) entries.push([match[2], match[1]]);
+  }
+  check(entries.length > 0, `${label}: FILES.sha256 为空`);
+  check(
+    !entries.some(([name]) => name === "FILES.sha256"),
+    `${label}: FILES.sha256 不应包含自身`,
+  );
+  for (const [name, expected] of entries) {
+    check(
+      !name.startsWith("/") && !name.split("/").includes(".."),
+      `${label}: FILES.sha256 路径无效: ${name}`,
+    );
+    let info;
+    const full = join(root, name);
+    try {
+      info = statSync(full);
+    } catch {
+      check(false, `${label}: 缺少 ${name}`);
+      continue;
+    }
+    check(info.isFile(), `${label}: ${name} 不是普通文件`);
+    const real = realpathSync(full);
+    check(
+      real === rootReal || real.startsWith(rootReal + sep),
+      `${label}: ${name} 指向应用目录外`,
+    );
+    const actual = createHash("sha256")
+      .update(readFileSync(full))
+      .digest("hex");
+    check(actual === expected, `${label}: ${name} 与 FILES.sha256 不一致`);
+  }
+}
+
 function checkDesktop(text, label) {
   check(text.includes("Exec=oddity"), `${label}: 桌面入口缺少 Exec=oddity`);
   check(
@@ -103,7 +148,7 @@ function checkDesktop(text, label) {
   );
 }
 
-function checkDeb(path, version) {
+function checkDeb(path, version, releaseManifest) {
   if (!have("dpkg-deb")) {
     console.warn("跳过 .deb 内部检查: 找不到 dpkg-deb");
     return;
@@ -154,12 +199,13 @@ function checkDeb(path, version) {
     ]) {
       check(statSync(join(temporary, name)).size > 0, `.deb 缺少 ${name}`);
     }
+    verifyAppManifest(join(temporary, "opt/Oddity"), ".deb", releaseManifest);
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
 }
 
-function checkRpm(path, version) {
+function checkRpm(path, version, releaseManifest) {
   if (!have("rpm")) {
     console.warn("跳过 .rpm 内部检查: 找不到 rpm");
     return;
@@ -188,9 +234,31 @@ function checkRpm(path, version) {
   ]) {
     check(files.includes(name), `.rpm 缺少 ${name}`);
   }
+  if (!have("rpm2cpio") || !have("bsdtar")) {
+    console.warn("跳过 .rpm 内的 FILES.sha256 检查: 缺少 rpm2cpio 或 bsdtar");
+    return;
+  }
+  const temporary = mkdtempSync(join(tmpdir(), "oddity-check-rpm-"));
+  try {
+    execFileSync(
+      "sh",
+      [
+        "-c",
+        `rpm2cpio ${shellQuote(path)} | bsdtar -xf - -C ${shellQuote(temporary)}`,
+      ],
+      { stdio: "ignore" },
+    );
+    verifyAppManifest(join(temporary, "opt/Oddity"), ".rpm", releaseManifest);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
 }
 
-function checkArch(path, version) {
+function shellQuote(value) {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function checkArch(path, version, releaseManifest) {
   if (!have("bsdtar")) {
     console.warn("跳过 .pkg.tar.zst 内部检查: 找不到 bsdtar");
     return;
@@ -231,6 +299,17 @@ function checkArch(path, version) {
     "usr/share/applications/oddity.desktop",
   ]);
   checkDesktop(desktop, ".pkg.tar.zst");
+  const temporary = mkdtempSync(join(tmpdir(), "oddity-check-arch-"));
+  try {
+    execFileSync("bsdtar", ["-xf", path, "-C", temporary], { stdio: "ignore" });
+    verifyAppManifest(
+      join(temporary, "opt/Oddity"),
+      ".pkg.tar.zst",
+      releaseManifest,
+    );
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
 }
 
 function checkArchiveLinks(archive, prefix = "") {
@@ -266,7 +345,7 @@ function checkArchiveLinks(archive, prefix = "") {
   }
 }
 
-function checkTarball(path, version) {
+function checkTarball(path, version, releaseManifest) {
   const name = `oddity-${version}-linux-x86_64`;
   checkArchiveLinks(path, name);
   const files = output("tar", ["-tzf", path]);
@@ -293,9 +372,16 @@ function checkTarball(path, version) {
       `tarball 缺少 ${size}x${size} 图标`,
     );
   }
+  const temporary = mkdtempSync(join(tmpdir(), "oddity-check-tar-"));
+  try {
+    execFileSync("tar", ["-xzf", path, "-C", temporary], { stdio: "ignore" });
+    verifyAppManifest(join(temporary, name), "tarball", releaseManifest);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
 }
 
-function checkAppImage(path) {
+function checkAppImage(path, releaseManifest) {
   chmodSync(path, 0o755);
   const temporary = mkdtempSync(join(tmpdir(), "oddity-check-appimage-"));
   try {
@@ -331,6 +417,7 @@ function checkAppImage(path) {
         `AppImage 缺少 ${size}x${size} 图标`,
       );
     }
+    verifyAppManifest(directory, "AppImage", releaseManifest);
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
@@ -346,6 +433,7 @@ function main() {
     `oddity-${version}-x86_64.AppImage`,
     `oddity-${version}-linux-x86_64.tar.gz`,
     `oddity-bin-${archVersion(version)}-1-x86_64.pkg.tar.zst`,
+    "FILES.sha256",
     "SHA256SUMS",
   ];
 
@@ -360,11 +448,12 @@ function main() {
 
   const payload = expected.filter((name) => name !== "SHA256SUMS");
   verifyChecksums(args.dir, payload);
-  checkDeb(join(args.dir, expected[0]), version);
-  checkRpm(join(args.dir, expected[1]), version);
-  checkAppImage(join(args.dir, expected[2]));
-  checkTarball(join(args.dir, expected[3]), version);
-  checkArch(join(args.dir, expected[4]), version);
+  const releaseManifest = readFileSync(join(args.dir, "FILES.sha256"), "utf8");
+  checkDeb(join(args.dir, expected[0]), version, releaseManifest);
+  checkRpm(join(args.dir, expected[1]), version, releaseManifest);
+  checkAppImage(join(args.dir, expected[2]), releaseManifest);
+  checkTarball(join(args.dir, expected[3]), version, releaseManifest);
+  checkArch(join(args.dir, expected[4]), version, releaseManifest);
 
   console.log(`发布资产检查通过 (${checks} 项)`);
 }

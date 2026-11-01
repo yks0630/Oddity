@@ -191,6 +191,8 @@ describe("浏览器命令桥接", () => {
     const { invoke, listenGameState } = await import("../../src/core/api");
     const first = await invoke("bootstrap");
     expect(first.appVersion).toBe(APP_VERSION);
+    expect(first.integrity.state).toBe("verified");
+    expect(first.integrity.releaseUrl).toContain("oddity-v");
     expect(first.installRoot).toBe("~/Games/Neverness To Everness");
     first.settings.theme = "dark";
     first.checks.length = 0;
@@ -320,6 +322,9 @@ describe("浏览器命令桥接", () => {
       }),
     ).toBe("/tmp/poster.png");
     expect(await invoke("open_url", { url: "https://example.com" })).toBeNull();
+    expect(
+      await invoke("integrity_acknowledge", { notice: "success" }),
+    ).toBeNull();
     for (const command of [
       "win_minimize",
       "win_toggle_maximize",
@@ -387,6 +392,39 @@ describe("原生命令和事件", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(dispose).not.toThrow();
+  });
+
+  it("传递安全验证结果并在订阅完成后解除监听", async () => {
+    const { listenIntegrityState } = await import("../../src/core/api");
+    const stop = vi.fn();
+    native.listen.mockResolvedValue(stop);
+    const handler = vi.fn();
+    const dispose = listenIntegrityState(handler);
+    const callback = native.listen.mock.calls[0][1] as (event: {
+      payload: Bootstrap["integrity"];
+    }) => void;
+    const payload = bootstrap().integrity;
+    callback({ payload });
+    expect(handler).toHaveBeenCalledWith(payload);
+    await Promise.resolve();
+    dispose();
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
+  it("安全验证订阅完成前解除也能释放资源", async () => {
+    const { listenIntegrityState } = await import("../../src/core/api");
+    let resolve!: (stop: () => void) => void;
+    native.listen.mockReturnValue(
+      new Promise<() => void>((done) => {
+        resolve = done;
+      }),
+    );
+    const dispose = listenIntegrityState(vi.fn());
+    dispose();
+    const stop = vi.fn();
+    resolve(stop);
+    await Promise.resolve();
+    expect(stop).toHaveBeenCalledOnce();
   });
 
   it("传递事件快照并在订阅完成后解除监听", async () => {

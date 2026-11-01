@@ -40,6 +40,7 @@ mod environment_commands;
 mod file_commands;
 mod game_mode_commands;
 mod gamepad_commands;
+mod integrity_commands;
 mod launch_progress;
 mod log_commands;
 mod native_session;
@@ -128,6 +129,7 @@ struct Bootstrap {
     checks: Vec<CheckItem>,
     runtime_installations: Vec<environment_commands::Installation>,
     settings: Settings,
+    integrity: nte_core::integrity::Status,
     app_version: String,
     os: String,
 }
@@ -1316,6 +1318,7 @@ fn bootstrap_impl(settings: &Settings) -> Bootstrap {
         checks,
         runtime_installations: environment_commands::installations(settings),
         settings: settings.clone(),
+        integrity: nte_core::integrity::Status::checking(env!("CARGO_PKG_VERSION"), 0),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         os: format!(
             "{} / {} / {}",
@@ -1376,9 +1379,16 @@ fn check_impl(
     })
 }
 
-fn bootstrap(state: &AppState) -> Bootstrap {
-    let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
-    bootstrap_impl(&settings)
+fn bootstrap(app: &service::Service) -> Bootstrap {
+    let settings = app
+        .state
+        .settings
+        .lock()
+        .map(|settings| settings.clone())
+        .unwrap_or_default();
+    let mut bootstrap = bootstrap_impl(&settings);
+    bootstrap.integrity = app.integrity.status();
+    bootstrap
 }
 
 fn launcher_background_paths(
@@ -1457,12 +1467,13 @@ fn download_paths_changed(current: &Settings, next: &Settings) -> bool {
         || current.global_install_root != next.global_install_root
 }
 
-fn save_settings(
-    state: &AppState,
-    downloads: &download_commands::DownloadManager,
-    settings: Settings,
-) -> Result<Bootstrap, String> {
-    let guard = downloads.inner.lock().map_err(|error| error.to_string())?;
+fn save_settings(app: &service::Service, settings: Settings) -> Result<Bootstrap, String> {
+    let state = &app.state;
+    let guard = app
+        .downloads
+        .inner
+        .lock()
+        .map_err(|error| error.to_string())?;
     let mut next = settings;
     next.snapshot_success_minutes =
         nte_core::snapshots::normalize_success_minutes(next.snapshot_success_minutes);
@@ -1501,7 +1512,7 @@ fn save_settings(
     drop(game);
     drop(current);
     drop(guard);
-    Ok(bootstrap_impl(&next))
+    Ok(bootstrap(app))
 }
 
 const WINDOW_GUARD_BYTES: &[u8] = include_bytes!("../../../helpers/nte-window-guard.dll");
@@ -2330,7 +2341,7 @@ async fn external_launch_impl(
             environment.as_deref(),
         )?;
         if selection.changed {
-            let _ = selected_app.emit("settings-changed", bootstrap_impl(&selection.settings));
+            let _ = selected_app.emit("settings-changed", crate::bootstrap(&selected_app));
         }
         Ok::<_, String>(selection)
     })

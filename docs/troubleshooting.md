@@ -114,6 +114,10 @@ Ubuntu 24.04 及更新版本可能通过 AppArmor 限制 user namespace. 优先�
 
 确认设置中的 **游戏退出后打开启动器** 已开启. 若关闭了该选项, Oddity 会留在托盘, 可以从托盘菜单打开主界面.
 
+## 启动器安全验证
+
+在 **设置 → 诊断与维护 → 运行诊断** 查看 **Oddity 安全性验证**. 状态显示启动器文件是否与当前版本 Release 的官方清单一致. 如果提示 **已修改**, 请从官方 Release 重新安装, 不要继续使用被改动的版本; 具体步骤和限制见[启动器安全验证](integrity.md).
+
 ## 日志与数据
 
 ### 导出日志
@@ -139,6 +143,7 @@ Oddity 在每次实际启动游戏前记录一份环境快照, 并在游戏进�
 | 内容          | 默认位置                                            |
 |-------------|-------------------------------------------------|
 | 设置          | `~/.config/oddity/settings.json`                |
+| 安全验证记录      | `~/.local/share/oddity/integrity.json`          |
 | 签到状态        | `~/.config/oddity/taygedo/state.json`           |
 | 日志目录        | `~/.local/share/oddity/logs/`                   |
 | 游玩记录        | `~/.local/share/oddity/playtime.json`          |

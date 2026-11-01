@@ -148,9 +148,10 @@ pub async fn environment_create(
     source_id: Option<String>,
     distribution: Distribution,
 ) -> Result<Bootstrap, String> {
-    crate::service::spawn_blocking(move || {
-        let state = &app.state;
-        let downloads = &app.downloads;
+    let worker = app.clone();
+    let mut bootstrap = crate::service::spawn_blocking(move || {
+        let state = &worker.state;
+        let downloads = &worker.downloads;
         create_impl(
             state,
             downloads,
@@ -161,7 +162,9 @@ pub async fn environment_create(
         )
     })
     .await
-    .map_err(|error| format!("创建运行环境任务失败: {error}"))?
+    .map_err(|error| format!("创建运行环境任务失败: {error}"))??;
+    bootstrap.integrity = app.integrity.status();
+    Ok(bootstrap)
 }
 
 fn create_impl(
@@ -257,13 +260,16 @@ pub async fn environment_action(
     action: String,
     id: Option<String>,
 ) -> Result<Bootstrap, String> {
-    crate::service::spawn_blocking(move || {
-        let state = &app.state;
-        let downloads = &app.downloads;
+    let worker = app.clone();
+    let mut bootstrap = crate::service::spawn_blocking(move || {
+        let state = &worker.state;
+        let downloads = &worker.downloads;
         action_impl(state, downloads, &action, id)
     })
     .await
-    .map_err(|error| format!("运行环境任务失败: {error}"))?
+    .map_err(|error| format!("运行环境任务失败: {error}"))??;
+    bootstrap.integrity = app.integrity.status();
+    Ok(bootstrap)
 }
 
 pub fn proton_path(settings: &Settings) -> Option<&Path> {

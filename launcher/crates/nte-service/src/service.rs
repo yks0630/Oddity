@@ -14,6 +14,7 @@ type Listener = (String, Box<dyn Fn(Value) + Send + 'static>);
 pub struct Service {
     pub state: AppState,
     pub downloads: crate::download_commands::DownloadManager,
+    pub integrity: crate::integrity_commands::IntegrityMonitor,
     pub playtime: crate::playtime_commands::Playtime,
     pub snapshots: crate::snapshot_commands::Snapshots,
     pub exports: crate::log_commands::LogExports,
@@ -40,6 +41,7 @@ impl Service {
                 game: Mutex::new(GameTracker::default()),
             },
             downloads: Default::default(),
+            integrity: crate::integrity_commands::IntegrityMonitor::new(data),
             playtime: crate::playtime_commands::Playtime::load(data),
             snapshots: crate::snapshot_commands::Snapshots::load(data),
             exports: Default::default(),
@@ -168,6 +170,7 @@ pub fn run() {
     {
         crate::attendance_commands::on_launch();
     }
+    crate::integrity_commands::start(app.clone());
     crate::update_scheduler::start(app.clone());
     let reader = app.clone();
     std::thread::spawn(move || {

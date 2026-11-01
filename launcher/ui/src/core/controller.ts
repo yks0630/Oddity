@@ -18,6 +18,7 @@ import type {
   PlaytimeHistory,
   Settings,
   MeteredPolicy,
+  IntegrityStatus,
 } from "../types/launcher";
 import {
   invoke,
@@ -26,6 +27,7 @@ import {
   listenDownloadState,
   listenPlaytimeStarted,
   listenSettingsChanged,
+  listenIntegrityState,
 } from "./api";
 import { notify, resetNotifications } from "./notifications";
 export { notify, notifications } from "./notifications";
@@ -53,6 +55,9 @@ let autoSaveRunning = false;
 let installationRefreshing = false;
 let installationRefreshPending = false;
 let pendingCheck: { full: boolean } | null = null;
+let latestIntegrity: IntegrityStatus | null = null;
+let displayedIntegrityNotice: IntegrityStatus["notice"] = null;
+const handledIntegrityNotices = new Set<string>();
 let saveStatusTimer = 0;
 let saveChain: Promise<boolean> = Promise.resolve(true);
 let lastSavedSettings = "";
@@ -473,6 +478,7 @@ export const ui = reactive({
   introStarted: false,
   introDone: false,
   scrollEdge: { top: false, bottom: false },
+  integrityDialog: false,
 });
 const BUNDLED_CROP_X = 0.54;
 const BUNDLED_CROP_Y = 0.38;
@@ -1154,6 +1160,62 @@ export function applyHeroMedia(input: string) {
   return value;
 }
 
+/// 安全验证结果可能先于 bootstrap 到达, 用检查时间判断新旧, 不把结果降级成检查中.
+export function applyIntegrityStatus(
+  status: IntegrityStatus,
+  previous: IntegrityStatus | null = latestIntegrity,
+) {
+  if (previous) {
+    const stale =
+      (status.checkedAt > 0 && previous.checkedAt > status.checkedAt) ||
+      (previous.state !== "checking" && status.state === "checking");
+    if (stale) {
+      if (state.bootstrap) state.bootstrap.integrity = previous;
+      return;
+    }
+  }
+  latestIntegrity = status;
+  if (state.bootstrap) state.bootstrap.integrity = status;
+  if (!status.notice) return;
+  const key = `${status.appVersion}:${status.notice}`;
+  if (handledIntegrityNotices.has(key)) return;
+  handledIntegrityNotices.add(key);
+  if (status.notice === "success") {
+    notify("Oddity 安全性验证通过。", "ok", 5000, { key: "integrity" });
+    void invoke("integrity_acknowledge", { notice: "success" }).catch(() => {});
+    return;
+  }
+  // 改动提示等用户关闭弹窗后再确认; 窗口崩溃或直接退出时, 下一次启动仍会提示.
+  displayedIntegrityNotice = "changed";
+  ui.integrityDialog = true;
+}
+
+export function dismissIntegrityDialog() {
+  ui.integrityDialog = false;
+  if (displayedIntegrityNotice !== "changed") return;
+  displayedIntegrityNotice = null;
+  if (latestIntegrity?.notice === "changed") {
+    latestIntegrity = { ...latestIntegrity, notice: null };
+    if (state.bootstrap) state.bootstrap.integrity = latestIntegrity;
+  }
+  void invoke("integrity_acknowledge", { notice: "changed" }).catch(() => {});
+}
+
+export async function openIntegrityRelease() {
+  const url = state.bootstrap?.integrity.releaseUrl;
+  if (!url) return;
+  try {
+    await invoke("open_url", { url });
+  } catch (error) {
+    notify(
+      error instanceof Error ? error.message : String(error),
+      "error",
+      6500,
+      { key: "integrity" },
+    );
+  }
+}
+
 function applyBootstrap(
   data: Bootstrap,
   announceError = true,
@@ -1163,6 +1225,7 @@ function applyBootstrap(
   const previous = state.bootstrap?.settings;
   const previousResolvedRoot = state.bootstrap?.installRoot;
   state.bootstrap = data;
+  applyIntegrityStatus(data.integrity);
   if (previous && previous.distribution !== data.settings.distribution) {
     bulletinRequest++;
     state.bulletins = null;
@@ -2284,6 +2347,9 @@ export async function init() {
   );
   disposers.push(listenDownloadState(applyDownloadStatus));
   disposers.push(
+    listenIntegrityState((status) => applyIntegrityStatus(status)),
+  );
+  disposers.push(
     listenSettingsChanged((data) => {
       // 外部启动已写入新设置, 丢弃尚未提交的旧表单, 避免随后覆盖.
       cancelAutoSaveTimer();
@@ -2365,6 +2431,7 @@ export function dispose() {
   introWaiters.length = 0;
   ui.introStarted = false;
   ui.introDone = false;
+  ui.integrityDialog = false;
   playtimeRequest++;
   playtimeRequestedAt = 0;
   lastLaunchStartedAt = null;

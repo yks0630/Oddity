@@ -184,6 +184,22 @@
 .settings-check-status.is-bad {
   color: var(--danger);
 }
+.settings-panel .integrity-files {
+  max-height: 220px;
+  overflow: auto;
+  margin: 10px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-family: monospace;
+  font-size: var(--text-xs);
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.settings-panel .integrity-files__hint {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
 .settings-search-results {
   z-index: 2;
   gap: 0;

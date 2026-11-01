@@ -14,6 +14,7 @@ import type {
   LauncherBackgroundMedia,
   PlaytimeHistory,
   Settings,
+  IntegrityStatus,
 } from "../../src/types/launcher";
 
 const backend = vi.hoisted(() => ({
@@ -21,10 +22,12 @@ const backend = vi.hoisted(() => ({
   unlisten: vi.fn(),
   downloadUnlisten: vi.fn(),
   settingsUnlisten: vi.fn(),
+  integrityUnlisten: vi.fn(),
   stopResize: vi.fn(),
   invoke: vi.fn(),
   handler: (_status: GameStatus) => {},
   settingsHandler: (_data: Bootstrap) => {},
+  integrityHandler: (_status: IntegrityStatus) => {},
   playtimeStarted: () => {},
   playtimeUnlisten: vi.fn(),
   downloadHandler: (_status: DownloadStatus) => {},
@@ -58,6 +61,10 @@ vi.mock("../../src/core/api", () => ({
   listenSettingsChanged: (handler: (data: Bootstrap) => void) => {
     backend.settingsHandler = handler;
     return backend.settingsUnlisten;
+  },
+  listenIntegrityState: (handler: (status: IntegrityStatus) => void) => {
+    backend.integrityHandler = handler;
+    return backend.integrityUnlisten;
   },
 }));
 vi.mock("../../src/core/gamepad", async (original) => ({
@@ -113,8 +120,10 @@ beforeEach(() => {
   backend.unlisten.mockClear();
   backend.downloadUnlisten.mockClear();
   backend.settingsUnlisten.mockClear();
+  backend.integrityUnlisten.mockClear();
   backend.stopResize.mockClear();
   backend.settingsHandler = () => {};
+  backend.integrityHandler = () => {};
   backend.data = bootstrap();
   backend.result = check();
   backend.status = session();
@@ -368,7 +377,10 @@ describe("启动与设置", () => {
     expect(c.attendance.loaded).toBe(true);
     expect(c.attendance.loading).toBe(false);
     expect(c.form.installRoot).toBe("/game");
-    expect(wrapper!.findAll(".check-row")).toHaveLength(1);
+    expect(wrapper!.findAll(".check-row")).toHaveLength(2);
+    expect(wrapper!.findAll(".check-row")[0].text()).toContain(
+      "Oddity 安全性验证",
+    );
     expect(c.displayVersion.value).toBe("0.1.0");
     expect(text("update-state-title")).toBe("已是最新");
     expect(button("app").classList.contains("is-intro-done")).toBe(true);
@@ -2918,4 +2930,194 @@ it("公告来源失败不缓存, 下次读取会重新请求", async () => {
   backend.invoke.mockResolvedValueOnce({ items: [], errors: [] });
   await c.fetchBulletins();
   expect(c.state.bulletins?.errors).toEqual([]);
+});
+
+it("在运行诊断中只读显示安全验证状态", async () => {
+  const c = await boot();
+  const { settingsNavigation } = await import("../../src/core/settingsCatalog");
+  c.showPage("settings");
+  settingsNavigation.category = "maintenance";
+  await nextTick();
+  const row = document.querySelector('[data-setting="integrity"]');
+  expect(row?.textContent).toContain("Oddity 安全性验证");
+  expect(row?.textContent).toContain("在线已验证");
+  expect(row?.textContent).toContain("官方清单比对通过");
+  expect(row?.textContent).toContain("来源: 在线官方清单");
+
+  backend.settingsHandler(
+    bootstrap({
+      integrity: {
+        ...backend.data.integrity,
+        state: "changed",
+        source: "bundled",
+        checkedAt: 2,
+        changed: ["README.md"],
+        changedTotal: 1,
+        notice: null,
+      },
+    }),
+  );
+  await nextTick();
+  expect(row?.textContent).toContain("与内置清单不一致");
+  expect(c.ui.integrityDialog).toBe(false);
+});
+
+it("安全验证发现改动时提示一次并列出变更文件", async () => {
+  const c = await boot();
+  backend.invoke.mockClear();
+  const changed = {
+    ...backend.data.integrity,
+    state: "changed" as const,
+    source: "bundled" as const,
+    checkedAt: 2,
+    changed: ["resources/app.asar", "oddity"],
+    changedTotal: 3,
+    notice: "changed" as const,
+  };
+  c.applyIntegrityStatus(changed);
+  await nextTick();
+  expect(c.ui.integrityDialog).toBe(true);
+  expect(document.body.textContent).toContain("Oddity 安全性验证未通过");
+  // 弹窗刚出现时不能直接确认, 否则窗口崩溃会让这次版本不再提示.
+  expect(backend.invoke).not.toHaveBeenCalledWith("integrity_acknowledge", {
+    notice: "changed",
+  });
+
+  const view = [
+    ...document.querySelectorAll<HTMLButtonElement>(".modal button"),
+  ].find((item) => item.textContent?.includes("查看变更文件"))!;
+  view.click();
+  await nextTick();
+  expect(document.body.textContent).toContain("resources/app.asar");
+  expect(document.body.textContent).toContain("共 3 项");
+
+  const later = [
+    ...document.querySelectorAll<HTMLButtonElement>(".modal button"),
+  ].find((item) => item.textContent?.includes("稍后处理"))!;
+  later.click();
+  await flushPromises();
+  expect(c.ui.integrityDialog).toBe(false);
+  expect(backend.invoke).toHaveBeenCalledWith("integrity_acknowledge", {
+    notice: "changed",
+  });
+
+  // 同一次运行里重复收到同一个提示不再弹窗.
+  c.applyIntegrityStatus({ ...changed, checkedAt: 3 });
+  await nextTick();
+  expect(c.ui.integrityDialog).toBe(false);
+});
+
+it("安全验证弹窗可以打开当前版本 Release", async () => {
+  const c = await boot();
+  c.applyIntegrityStatus({
+    ...backend.data.integrity,
+    state: "changed",
+    source: "bundled",
+    checkedAt: 2,
+    changed: ["resources/app.asar"],
+    changedTotal: 1,
+    notice: "changed",
+  });
+  await nextTick();
+  backend.invoke.mockClear();
+  const download = [
+    ...document.querySelectorAll<HTMLButtonElement>(".modal button"),
+  ].find((item) => item.textContent?.includes("前往下载官方版本"))!;
+  download.click();
+  await flushPromises();
+  expect(backend.invoke).toHaveBeenCalledWith("open_url", {
+    url: "https://github.com/LaT-SKY/Oddity/releases/tag/oddity-v0.1.0",
+  });
+});
+
+it("打开官方下载页失败时给出提示", async () => {
+  const c = await boot();
+  c.applyIntegrityStatus({
+    ...backend.data.integrity,
+    state: "changed",
+    source: "bundled",
+    checkedAt: 2,
+    changed: ["resources/app.asar"],
+    changedTotal: 1,
+    notice: "changed",
+  });
+  await nextTick();
+  const base = backend.invoke.getMockImplementation()!;
+  backend.invoke.mockImplementation((command: string, args: never) =>
+    command === "open_url"
+      ? Promise.reject(new Error("打开链接失败"))
+      : base(command, args),
+  );
+  await c.openIntegrityRelease();
+  await flushPromises();
+  expect(noticeMessage()).toContain("打开链接失败");
+});
+
+it("安全验证从失败恢复时只发一次成功通知", async () => {
+  const c = await boot();
+  c.applyIntegrityStatus({
+    ...backend.data.integrity,
+    state: "unverified",
+    source: null,
+    checkedAt: 1,
+    notice: null,
+  });
+  backend.invoke.mockClear();
+  c.applyIntegrityStatus({
+    ...backend.data.integrity,
+    checkedAt: 2,
+    notice: "success",
+  });
+  await flushPromises();
+  expect(noticeMessage()).toContain("Oddity 安全性验证通过");
+  expect(backend.invoke).toHaveBeenCalledWith("integrity_acknowledge", {
+    notice: "success",
+  });
+
+  // 同一版本内再次收到成功提示时不重复通知.
+  c.applyIntegrityStatus({
+    ...backend.data.integrity,
+    state: "unverified",
+    source: null,
+    checkedAt: 3,
+    notice: null,
+  });
+  c.applyIntegrityStatus({
+    ...backend.data.integrity,
+    checkedAt: 4,
+    notice: "success",
+  });
+  expect(
+    backend.invoke.mock.calls.filter(
+      ([command]) => command === "integrity_acknowledge",
+    ),
+  ).toHaveLength(1);
+});
+
+it("安全验证结果先于 bootstrap 到达时不会降级", async () => {
+  const c = await boot();
+  c.applyIntegrityStatus({
+    ...backend.data.integrity,
+    checkedAt: 9,
+  });
+  expect(c.state.bootstrap?.integrity.checkedAt).toBe(9);
+  c.applyIntegrityStatus({
+    ...backend.data.integrity,
+    state: "checking",
+    checkedAt: 1,
+  });
+  expect(c.state.bootstrap?.integrity.state).toBe("verified");
+  expect(c.state.bootstrap?.integrity.checkedAt).toBe(9);
+
+  backend.settingsHandler(
+    bootstrap({
+      integrity: {
+        ...backend.data.integrity,
+        state: "checking",
+        checkedAt: 0,
+      },
+    }),
+  );
+  await nextTick();
+  expect(c.state.bootstrap?.integrity.state).toBe("verified");
 });

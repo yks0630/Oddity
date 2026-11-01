@@ -130,7 +130,7 @@ jobs:
       - name: 检查打包元数据
         run: |
           node scripts/check-packaging.mjs
-          node --test scripts/electron-builder.test.mjs
+          node --test scripts/electron-builder.test.mjs scripts/file-manifest.test.mjs
 
       - name: 构建 Release 二进制文件
         working-directory: launcher

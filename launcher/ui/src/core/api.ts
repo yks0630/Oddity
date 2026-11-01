@@ -25,6 +25,7 @@ import type {
   SnapshotOverview,
   SnapshotReference,
   SnapshotSummary,
+  IntegrityStatus,
 } from "../types/launcher";
 export { isDesktop };
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value));
@@ -199,6 +200,16 @@ const mock: Bootstrap = {
     minimizeToTrayOnClose: true,
     showLauncherAfterGameExit: true,
     snapshotSuccessMinutes: 1,
+  },
+  integrity: {
+    state: "verified",
+    source: "online",
+    checkedAt: Date.now() - 60_000,
+    changed: [],
+    changedTotal: 0,
+    notice: null,
+    appVersion: APP_VERSION,
+    releaseUrl: `https://github.com/LaT-SKY/Oddity/releases/tag/oddity-v${APP_VERSION}`,
   },
   appVersion: APP_VERSION,
   os: previewOs(),
@@ -610,6 +621,25 @@ export function listenSettingsChanged(handler: (data: Bootstrap) => void) {
   let disposed = false;
   let unlisten: (() => void) | null = null;
   listen<Bootstrap>("settings-changed", (event) => handler(event.payload))
+    .then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    })
+    .catch(() => {});
+  return () => {
+    disposed = true;
+    if (unlisten) unlisten();
+  };
+}
+
+/// 启动器安全验证在后台完成或状态变化时推送.
+export function listenIntegrityState(
+  handler: (status: IntegrityStatus) => void,
+) {
+  if (!isDesktop()) return () => {};
+  let disposed = false;
+  let unlisten: (() => void) | null = null;
+  listen<IntegrityStatus>("integrity-state", (event) => handler(event.payload))
     .then((stop) => {
       if (disposed) stop();
       else unlisten = stop;
@@ -1076,6 +1106,8 @@ async function previewInvoke(
       previewSnapshotAttempts = 0;
       return null;
     case "open_url":
+      return null;
+    case "integrity_acknowledge":
       return null;
     case "prepare_log_export":
     case "save_log_export":

@@ -34,7 +34,8 @@ import SettingRow from "../components/settings/SettingRow.vue";
 import LogExport from "../components/LogExport.vue";
 import EnvironmentSnapshots from "../components/EnvironmentSnapshots.vue";
 import GamepadSettings from "../components/GamepadSettings.vue";
-import type { MeteredPolicy } from "../types/launcher";
+import BaseDisclosure from "../components/BaseDisclosure.vue";
+import type { IntegrityState, MeteredPolicy } from "../types/launcher";
 
 const root = ref<HTMLElement | null>(null);
 const { control, surface, reduced } = useControlMotion();
@@ -257,6 +258,68 @@ function resultKeys(event: KeyboardEvent) {
   }
 }
 const isActive = computed(() => state.page === "settings");
+const integrity = computed(() => state.bootstrap?.integrity ?? null);
+const integrityChanged = computed(() => integrity.value?.changed ?? []);
+const integrityTotal = computed(() => integrity.value?.changedTotal ?? 0);
+const integrityTruncated = computed(() => {
+  const status = integrity.value;
+  return Boolean(status && status.changedTotal > status.changed.length);
+});
+const integrityLabels: Record<IntegrityState, string> = {
+  checking: "正在检查",
+  verified: "在线已验证",
+  baseline: "离线基线通过",
+  unverified: "未验证",
+  changed: "已修改",
+  unsupported: "不支持校验",
+};
+const integrityLabel = computed(() =>
+  integrity.value ? integrityLabels[integrity.value.state] : "未检查",
+);
+const integrityBad = computed(() => integrity.value?.state === "changed");
+const integrityDot = computed(() => {
+  const value = integrity.value?.state;
+  if (value === "verified" || value === "baseline") return "is-ok";
+  if (value === "changed") return "is-bad";
+  return "";
+});
+function formatIntegrityTime(value: number) {
+  return new Date(value).toLocaleString("zh-CN", { hour12: false });
+}
+const integritySummary = computed(() => {
+  const status = integrity.value;
+  if (!status) return "等待检查";
+  const parts: string[] = [];
+  switch (status.state) {
+    case "checking":
+      parts.push(status.checkedAt ? "正在重新检查" : "正在检查");
+      break;
+    case "verified":
+      parts.push("官方清单比对通过");
+      break;
+    case "baseline":
+      parts.push("联网失败, 已按内置清单比对");
+      break;
+    case "unverified":
+      parts.push("本次未能完成校验");
+      break;
+    case "changed":
+      parts.push(
+        status.source === "bundled"
+          ? `发现 ${status.changedTotal} 个文件与内置清单不一致`
+          : `发现 ${status.changedTotal} 个文件与官方发布不一致`,
+      );
+      break;
+    case "unsupported":
+      parts.push("当前安装方式不支持校验");
+      break;
+  }
+  if (status.source === "online") parts.push("来源: 在线官方清单");
+  if (status.source === "bundled") parts.push("来源: 内置清单");
+  if (status.checkedAt)
+    parts.push(`上次检查: ${formatIntegrityTime(status.checkedAt)}`);
+  return parts.join(" · ");
+});
 </script>
 
 <template>
@@ -764,6 +827,43 @@ const isActive = computed(() => state.page === "settings");
                 <div data-setting="diagnostics" tabindex="-1">
                   <SettingGroup title="运行诊断"
                     ><div id="settings-checks" class="checks">
+                      <div
+                        data-setting="integrity"
+                        tabindex="-1"
+                        class="check-row"
+                      >
+                        <i
+                          class="check-dot"
+                          :class="integrityDot"
+                          aria-hidden="true"
+                        />
+                        <div class="check-copy">
+                          <strong>Oddity 安全性验证</strong
+                          ><span>{{ integritySummary }}</span>
+                        </div>
+                        <span
+                          class="settings-check-status"
+                          :class="{ 'is-bad': integrityBad }"
+                          >{{ integrityLabel }}</span
+                        >
+                      </div>
+                      <BaseDisclosure
+                        v-if="integrityChanged.length"
+                        title="查看变更文件"
+                      >
+                        <ul class="integrity-files">
+                          <li v-for="file in integrityChanged" :key="file">
+                            {{ file }}
+                          </li>
+                        </ul>
+                        <p
+                          v-if="integrityTruncated"
+                          class="integrity-files__hint"
+                        >
+                          共 {{ integrityTotal }} 项, 仅显示前
+                          {{ integrityChanged.length }} 项.
+                        </p>
+                      </BaseDisclosure>
                       <div
                         v-for="(item, index) in state.bootstrap?.checks ?? []"
                         :key="index"

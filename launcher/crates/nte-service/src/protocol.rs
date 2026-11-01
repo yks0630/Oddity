@@ -338,11 +338,22 @@ pub async fn dispatch(app: ServiceHandle, command: String, args: Value) -> Resul
             .map_err(|e| json!(e.to_string()))
         }
         "bootstrap" => serde_json::to_value(
-            crate::service::spawn_blocking(move || crate::bootstrap(&app.state))
+            crate::service::spawn_blocking(move || crate::bootstrap(&app))
                 .await
                 .map_err(|e| json!(e.to_string()))?,
         )
         .map_err(|e| json!(e.to_string())),
+        "integrity_acknowledge" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct Args {
+                notice: String,
+            }
+            let args: Args = serde_json::from_value(args).map_err(|e| json!(e.to_string()))?;
+            crate::integrity_commands::acknowledge(&app, &args.notice)
+                .map_err(|error| json!(error))?;
+            Ok(Value::Null)
+        }
         "launcher_background" => serde_json::to_value(
             crate::service::spawn_blocking(move || crate::launcher_background(&app.state))
                 .await
@@ -385,12 +396,10 @@ pub async fn dispatch(app: ServiceHandle, command: String, args: Value) -> Resul
             }
             let args: Args = serde_json::from_value(args).map_err(|e| json!(e.to_string()))?;
             serde_json::to_value(
-                crate::service::spawn_blocking(move || {
-                    crate::save_settings(&app.state, &app.downloads, args.settings)
-                })
-                .await
-                .map_err(|e| json!(e.to_string()))?
-                .map_err(|e| serde_json::to_value(e).unwrap_or(Value::Null))?,
+                crate::service::spawn_blocking(move || crate::save_settings(&app, args.settings))
+                    .await
+                    .map_err(|e| json!(e.to_string()))?
+                    .map_err(|e| serde_json::to_value(e).unwrap_or(Value::Null))?,
             )
             .map_err(|e| json!(e.to_string()))
         }

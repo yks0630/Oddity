@@ -193,6 +193,25 @@ export interface CheckItem {
   ok: boolean;
   detail: string;
 }
+export type IntegrityState =
+  | "checking"
+  | "verified"
+  | "baseline"
+  | "unverified"
+  | "changed"
+  | "unsupported";
+export type IntegritySource = "online" | "bundled";
+export type IntegrityNotice = "success" | "changed";
+export interface IntegrityStatus {
+  state: IntegrityState;
+  source: IntegritySource | null;
+  checkedAt: number;
+  changed: string[];
+  changedTotal: number;
+  notice: IntegrityNotice | null;
+  appVersion: string;
+  releaseUrl: string;
+}
 export interface Bootstrap {
   ok: boolean;
   error: string | null;
@@ -212,6 +231,7 @@ export interface Bootstrap {
   checks: CheckItem[];
   runtimeInstallations: RuntimeInstallation[];
   settings: Settings;
+  integrity: IntegrityStatus;
   appVersion: string;
   os: string;
 }
@@ -402,6 +422,7 @@ export interface Commands {
   attendance_keyring_check: void;
   launcher_background: LauncherBackgroundMedia;
   bootstrap: Bootstrap;
+  integrity_acknowledge: null;
   check_update: CheckResult;
   fetch_bulletins: BulletinFeed;
   save_settings: Bootstrap;
@@ -460,6 +481,7 @@ export interface CommandArgs {
   attendance_keyring_check: undefined;
   launcher_background: undefined;
   bootstrap: undefined;
+  integrity_acknowledge: { notice: IntegrityNotice };
   check_update: { full: boolean };
   fetch_bulletins: { distribution: "cn" | "global" };
   save_settings: { settings: Settings };

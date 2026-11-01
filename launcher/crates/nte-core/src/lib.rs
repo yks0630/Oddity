@@ -17,6 +17,7 @@ pub mod game_mode;
 pub mod gamepad;
 pub mod install;
 pub mod install_lock;
+pub mod integrity;
 pub mod launch;
 pub mod logs;
 pub mod manifest;

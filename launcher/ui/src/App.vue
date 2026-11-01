@@ -13,6 +13,7 @@ import { useSceneMotion, playerExpanded } from "./composables/useSceneMotion";
 import { useScenePalette } from "./composables/useScenePalette";
 import { navigationScrubbing } from "./composables/navigationGesture";
 import NotificationCenter from "./components/NotificationCenter.vue";
+import IntegrityDialog from "./components/IntegrityDialog.vue";
 import TitleBar from "./components/layout/TitleBar.vue";
 import HeroMedia from "./components/HeroMedia.vue";
 import HomePage from "./pages/HomePage.vue";
@@ -122,6 +123,7 @@ onBeforeUnmount(() => {
         </main>
       </div>
       <NotificationCenter />
+      <IntegrityDialog />
       <GamepadFilePicker />
       <GamepadKeyboard />
       <GamepadOverlay />

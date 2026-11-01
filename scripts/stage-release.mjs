@@ -105,6 +105,7 @@ function stageTarball(version, target, out) {
       "resources/app.asar",
       "libffmpeg.so",
       "LICENSES.chromium.html",
+      "FILES.sha256",
     ])
       requireFile(join(directory, name));
 
@@ -172,7 +173,19 @@ function main() {
 
   const archive = stageTarball(version, target, args.out);
 
-  for (const file of [debTarget, rpmTarget, appImageTarget, archive]) {
+  // 应用内的文件清单同时作为 Release 资产, 供非 AppImage 安装在线比对.
+  const appManifest = requireFile(join(target, "linux-unpacked/FILES.sha256"));
+  const manifestTarget = join(args.out, "FILES.sha256");
+  copyFileSync(appManifest, manifestTarget);
+  chmodSync(manifestTarget, 0o644);
+
+  for (const file of [
+    debTarget,
+    rpmTarget,
+    appImageTarget,
+    archive,
+    manifestTarget,
+  ]) {
     console.log(`staged: ${file}`);
   }
 }

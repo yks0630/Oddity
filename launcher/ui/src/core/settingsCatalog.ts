@@ -141,6 +141,13 @@ export const settingsEntries = [
     description: "检查启动器配置、游戏文件与运行依赖.",
     keywords: "检测 检查 umu prefix Proton 故障 配置",
   },
+  {
+    id: "integrity",
+    category: "maintenance",
+    label: "Oddity 安全性验证",
+    description: "核对启动器文件是否与官方发布一致.",
+    keywords: "安全 校验 完整性 文件 篡改 官方 清单 重装",
+  },
 ] as const satisfies readonly {
   id: string;
   category: SettingsCategory;

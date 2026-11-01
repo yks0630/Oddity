@@ -80,7 +80,10 @@ test("导航、更新、设置、快捷键与启动关闭流程", async ({ page 
   await page.keyboard.press("Control+6");
   await expect(page.locator("#page-settings")).toBeVisible();
   await settingsCategory(page, "maintenance");
-  await expect(page.locator(".check-row")).toHaveCount(6);
+  await expect(page.locator(".check-row")).toHaveCount(7);
+  await expect(page.locator('[data-setting="integrity"]')).toContainText(
+    "在线已验证",
+  );
   await settingsCategory(page, "appearance");
   await page.locator("#set-theme-trigger").click();
   await page.getByRole("option", { name: "暗色", exact: true }).click();
