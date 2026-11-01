@@ -7,8 +7,10 @@ test("更新摘要、暂停继续与窄面板布局", async ({ page }) => {
   const update = page.locator("#page-update");
   const primary = page.locator("#game-download-primary");
   const budget = update.locator(".disk-budget");
+  const homeStatus = page.locator("#home-status");
   await expect(primary).toHaveText("检查通过");
   await expect(budget).toHaveCount(0);
+  await expect(homeStatus).toHaveCSS("visibility", "hidden");
   await update.getByRole("button", { name: "完整校验", exact: true }).click();
   await expect(primary).toHaveText("更新游戏");
   await expect(update.locator("progress")).toHaveCount(0);
@@ -21,6 +23,9 @@ test("更新摘要、暂停继续与窄面板布局", async ({ page }) => {
   await expect(
     update.getByRole("heading", { name: "下载已暂停" }),
   ).toBeVisible();
+  await expect(homeStatus).toHaveCSS("visibility", "visible");
+  await expect(homeStatus).toHaveCSS("opacity", "1");
+  await expect(homeStatus).toContainText("下载已暂停, 打开更新页继续");
   await expect(primary).toHaveText("继续更新游戏");
   await expect(update.locator("progress")).toHaveCount(1);
   await expect(update.locator("#download-install-root")).toBeEnabled();

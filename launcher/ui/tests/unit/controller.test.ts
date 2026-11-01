@@ -1132,6 +1132,32 @@ describe("更新检查", () => {
     expect(c.launchView.value.label).toBe("启动游戏");
   });
 
+  it("首页启动提示在固定槽位内显隐", async () => {
+    await boot();
+    const slot = wrapper!.find(".hero__status-slot");
+    backend.downloadHandler({
+      ...backend.downloadStatus,
+      mode: "check",
+      phase: "cancelled",
+    });
+    await nextTick();
+    expect(slot.classes()).toContain("is-visible");
+    expect(wrapper!.find("#home-status").attributes("aria-hidden")).toBe(
+      undefined,
+    );
+    expect(text("home-status-text")).toBe("资源检查已取消, 打开更新页重新检查");
+    backend.downloadHandler({
+      ...backend.downloadStatus,
+      mode: "check",
+      phase: "checking",
+    });
+    await nextTick();
+    expect(slot.classes()).not.toContain("is-visible");
+    expect(wrapper!.find("#home-status").attributes("aria-hidden")).toBe(
+      "true",
+    );
+  });
+
   it("为国际服保存独立目录并展示可暂停的下载任务", async () => {
     const c = await boot();
     c.form.distribution = "global";

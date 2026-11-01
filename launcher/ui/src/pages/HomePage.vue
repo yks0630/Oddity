@@ -23,6 +23,12 @@ const reduced = computed(() => form.reduceMotion || prefersReduced.value);
 const gameName = computed(() =>
   state.bootstrap?.settings.distribution === "global" ? "NTE" : "异环",
 );
+// 状态行始终占位, 避免提示显隐时把标题和启动按钮一起顶动.
+const statusVisible = computed(
+  () =>
+    state.game !== "launching" &&
+    (homeDownloadNotice.value.visible || updateView.value.showHomeStatus),
+);
 
 // 文案切换沿用 GamepadHints 的 Anime.js 编排: 先模糊退出, 再换字。
 const label = computed(() => launchView.value.label);
@@ -165,28 +171,31 @@ function handleMainLaunchClick() {
               </AnimatePresence>
             </div>
           </div>
-          <button
-            class="hero__status"
-            id="home-status"
-            @click="showPage('update')"
-            type="button"
-            :hidden="
-              state.game === 'launching' ||
-              (!homeDownloadNotice.visible && !updateView.showHomeStatus)
-            "
-            :data-state="
-              homeDownloadNotice.visible
-                ? homeDownloadNotice.kind
-                : updateView.homeStatusKind
-            "
+          <div
+            class="hero__status-slot"
+            :class="{ 'is-visible': statusVisible }"
           >
-            <i class="status-dot status-dot--warn"></i>
-            <span id="home-status-text">{{
-              homeDownloadNotice.visible
-                ? homeDownloadNotice.text
-                : updateView.homeStatusText
-            }}</span>
-          </button>
+            <button
+              class="hero__status"
+              id="home-status"
+              @click="showPage('update')"
+              type="button"
+              :tabindex="statusVisible ? undefined : -1"
+              :aria-hidden="!statusVisible || undefined"
+              :data-state="
+                homeDownloadNotice.visible
+                  ? homeDownloadNotice.kind
+                  : updateView.homeStatusKind
+              "
+            >
+              <i class="status-dot status-dot--warn"></i>
+              <span id="home-status-text">{{
+                homeDownloadNotice.visible
+                  ? homeDownloadNotice.text
+                  : updateView.homeStatusText
+              }}</span>
+            </button>
+          </div>
         </motion.div>
       </div>
     </div>

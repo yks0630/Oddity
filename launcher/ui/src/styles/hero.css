@@ -40,9 +40,10 @@
   background: linear-gradient(0deg, rgb(5 10 16 / 65%), transparent 45%);
 }
 .hero__content {
+  --hero-content-shift: clamp(20px, 2.2vw, 32px);
   position: absolute;
   bottom: var(--scene-inset);
-  left: var(--scene-inset);
+  left: calc(var(--scene-inset) + var(--hero-content-shift));
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -128,24 +129,59 @@
   width: 22px;
   height: 22px;
 }
+.hero__status-slot {
+  display: flex;
+  align-items: flex-start;
+  height: calc(16px + 1.55em);
+  padding-top: 16px;
+  font-size: 12px;
+}
+/* 窄面板下最长文案会换行, 预留两行高度, 避免底部内容被顶动. */
+@media (width < 480px) {
+  .hero__status-slot {
+    height: calc(16px + 3.1em);
+  }
+}
 .hero__status {
   display: inline-flex;
   align-items: center;
   gap: 9px;
-  margin-top: 16px;
   max-width: 100%;
   text-align: left;
   font-size: 12px;
   color: rgb(255 255 255 / 88%);
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(4px);
+  transition:
+    opacity 160ms ease-out,
+    transform 160ms ease-out,
+    visibility 0s linear 160ms;
 }
-.hero__status[hidden] {
-  display: none;
+.hero__status-slot.is-visible .hero__status {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+  transition:
+    opacity 160ms ease-out,
+    transform 160ms ease-out,
+    visibility 0s;
 }
 .hero__status[data-state="error"] {
   color: #ffd0c9;
 }
 .hero__status .status-dot {
   background: currentColor;
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero__status,
+  .hero__status-slot.is-visible .hero__status {
+    transition: none;
+  }
+}
+.reduce-motion .hero__status,
+.reduce-motion .hero__status-slot.is-visible .hero__status {
+  transition: none;
 }
 .eyebrow {
   display: flex;
