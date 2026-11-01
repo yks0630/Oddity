@@ -1,0 +1,75 @@
+# 首次启用需在仓库 Settings → Pages 的 Source 中选择 "GitHub Actions"。
+name: 浏览器演示
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'launcher/ui/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: 构建演示站
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # configure-pages 需要读取 Pages 配置, 部署令牌只在 deploy 作业申请.
+    permissions:
+      contents: read
+      pages: write
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v7
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: launcher/ui/package.json
+          run_install: false
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: launcher/ui/pnpm-lock.yaml
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+        working-directory: launcher/ui
+
+      - name: 构建浏览器演示
+        run: pnpm run build:demo
+        working-directory: launcher/ui
+
+      - name: 配置 Pages
+        uses: actions/configure-pages@v6
+
+      - name: 上传演示产物
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: launcher/ui/dist
+
+  deploy:
+    name: 部署演示站
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 部署到 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

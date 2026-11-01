@@ -29,6 +29,7 @@ import {
   listenSettingsChanged,
   listenIntegrityState,
 } from "./api";
+import { DEMO_NOTICE_KEY, isDemo } from "./demo";
 import { notify, resetNotifications } from "./notifications";
 export { notify, notifications } from "./notifications";
 import { latestSession, formatPlaytime } from "./playtime";
@@ -479,6 +480,7 @@ export const ui = reactive({
   introDone: false,
   scrollEdge: { top: false, bottom: false },
   integrityDialog: false,
+  demoNotice: false,
 });
 const BUNDLED_CROP_X = 0.54;
 const BUNDLED_CROP_Y = 0.38;
@@ -1242,6 +1244,18 @@ export async function openIntegrityRelease() {
       { key: "integrity" },
     );
   }
+}
+
+export function openDemoNotice() {
+  ui.demoNotice = true;
+}
+
+// 关闭后不再自动弹出, 仍可从标题栏重新打开。
+export function closeDemoNotice() {
+  ui.demoNotice = false;
+  try {
+    localStorage.setItem(DEMO_NOTICE_KEY, "1");
+  } catch {}
 }
 
 function applyBootstrap(
@@ -2414,6 +2428,16 @@ export async function init() {
 
   startIntro();
 
+  if (isDemo)
+    whenIntroDone(() => {
+      let seen = false;
+      // 存储不可用时按首次访问处理, 仍需提示演示范围.
+      try {
+        seen = Boolean(localStorage.getItem(DEMO_NOTICE_KEY));
+      } catch {}
+      if (!seen) openDemoNotice();
+    });
+
   if (state.bootstrap && (state.bootstrap.ok || state.bootstrap.gameExists)) {
     whenIntroDone(() => {
       schedule(
@@ -2460,6 +2484,7 @@ export function dispose() {
   ui.introStarted = false;
   ui.introDone = false;
   ui.integrityDialog = false;
+  ui.demoNotice = false;
   playtimeRequest++;
   playtimeRequestedAt = 0;
   lastLaunchStartedAt = null;

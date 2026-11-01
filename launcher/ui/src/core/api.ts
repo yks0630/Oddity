@@ -4,6 +4,7 @@ import { defaultAttendanceTasks } from "./attendanceTasks";
 import { distributions } from "./distribution";
 import { APP_VERSION } from "./version";
 import { nativeInvoke, isDesktop, listen } from "./desktop";
+import { applyDemoPreview, isDemo } from "./demo";
 import type {
   Bootstrap,
   CheckResult,
@@ -214,6 +215,13 @@ const mock: Bootstrap = {
   appVersion: APP_VERSION,
   os: previewOs(),
 };
+
+if (isDemo)
+  applyDemoPreview(mock, {
+    protonPath: preview.protonPath,
+    protonName: preview.protonName,
+    prefix: preview.prefix,
+  });
 
 const previewSnapshotNow = Date.now();
 let previewSnapshotAttempts = 2;
@@ -463,7 +471,7 @@ const mockBulletins: BulletinFeed = {
       title: "《异环》版本前瞻特别节目 | 情报回顾",
       summary: "版本前瞻回顾",
       url: distributions.cn.official,
-      imageUrl: "/assets/hero-keyart.jpg",
+      imageUrl: new URL("assets/hero-keyart.jpg", document.baseURI).href,
       publishedAt: "",
       source: "版本前瞻",
     },

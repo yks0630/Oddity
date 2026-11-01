@@ -11,6 +11,7 @@
 
 [![Release](https://img.shields.io/github/v/release/LaT-SKY/Oddity?include_prereleases&label=release)](https://github.com/LaT-SKY/Oddity/releases)
 [![Platform](https://img.shields.io/badge/platform-Linux-informational)](https://github.com/LaT-SKY/Oddity)
+[![在线体验](https://img.shields.io/badge/demo-online-brightgreen)](https://lat-sky.github.io/Oddity/)
 [![License](https://img.shields.io/github/license/LaT-SKY/Oddity)](LICENSE)
 
 </div>
@@ -81,6 +82,8 @@ NixOS 和 Gentoo 请参阅 [Nix 指南](docs/nix.md) 与 [Gentoo 指南](docs/ge
   <img src="docs/assets/launcher-settings.png" width="48%" alt="设置界面">
 </p>
 
+不想安装也可以先在[浏览器演示](https://lat-sky.github.io/Oddity/)中体验界面；演示使用示例数据，安装、下载、更新与签到等功能仅桌面版可用，详见[浏览器演示文档](docs/demo.md)。
+
 # _Technical Differences_
 
 Oddity 针对官方启动器的部分行为进行了改进，重点在于下载可靠性、更新效率与 Linux 兼容性。
@@ -99,6 +102,7 @@ Oddity 针对官方启动器的部分行为进行了改进，重点在于下载�
 - [Proton 运行环境](docs/runtime-environments.md) — A/B 环境、prefix 与快照。
 - [外部启动](docs/external-launch.md) — 应用菜单、Steam 与命令行。
 - [塔吉多指南](docs/taygedo.md) — 账号登录、自动签到与游戏数据查询。
+- [浏览器演示](docs/demo.md) — 在线体验界面与部署说明。
 
 遇到问题？请前往 [Issues](https://github.com/LaT-SKY/Oddity/issues) 反馈。
 

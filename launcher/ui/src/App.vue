@@ -18,11 +18,13 @@ import {
   showPage,
   dispose,
 } from "./core/controller";
+import { isDemo } from "./core/demo";
 import { useSceneMotion, playerExpanded } from "./composables/useSceneMotion";
 import { useScenePalette } from "./composables/useScenePalette";
 import { navigationScrubbing } from "./composables/navigationGesture";
 import NotificationCenter from "./components/NotificationCenter.vue";
 import IntegrityDialog from "./components/IntegrityDialog.vue";
+import DemoNotice from "./components/DemoNotice.vue";
 import TitleBar from "./components/layout/TitleBar.vue";
 import HeroMedia from "./components/HeroMedia.vue";
 import WallpaperFade from "./components/WallpaperFade.vue";
@@ -104,6 +106,7 @@ onBeforeUnmount(() => {
         'reduce-motion': form.reduceMotion,
         'has-drawer': opened,
         'gamepad-mode': gamepad.active,
+        'is-demo': isDemo,
       }"
     >
       <div class="app__wallpaper" aria-hidden="true">
@@ -152,6 +155,7 @@ onBeforeUnmount(() => {
       </div>
       <NotificationCenter />
       <IntegrityDialog />
+      <DemoNotice v-if="isDemo" />
       <GamepadFilePicker />
       <GamepadKeyboard />
       <GamepadOverlay />

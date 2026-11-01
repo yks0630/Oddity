@@ -1,0 +1,74 @@
+/* 浏览器演示模式的入口与说明弹窗。 */
+.demo-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-8);
+  padding: 7px 12px;
+  border-radius: 9px;
+  background: rgb(0 0 0 / 28%);
+  color: #fff;
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+.demo-chip .icon {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+.demo-chip:hover {
+  background: rgb(0 0 0 / 42%);
+}
+.demo-notice {
+  display: grid;
+  gap: var(--space-14);
+}
+.demo-notice p {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: var(--text-md);
+  line-height: 1.7;
+}
+.demo-notice__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-10);
+}
+.demo-notice__legal {
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+@media (max-width: 979px) {
+  .demo-chip span {
+    display: none;
+  }
+}
+/* 窄屏标题栏空间有限, 收窄演示入口, 必要时让出品牌位置, 避免入口被裁掉。 */
+@media (max-width: 560px) {
+  .app.is-demo .titlebar {
+    gap: 8px;
+    padding-right: 8px;
+  }
+  .app.is-demo .demo-chip {
+    gap: 0;
+    padding: 5px;
+  }
+  .app.is-demo .demo-chip .icon {
+    width: 16px;
+    height: 16px;
+  }
+}
+@media (max-width: 380px) {
+  .app.is-demo .titlebar__brand {
+    display: none;
+  }
+}
+/* 极窄屏标题栏放不下时把入口移到右下角, 说明与下载入口始终可以打开。 */
+@media (max-width: 340px) {
+  .app.is-demo .demo-chip {
+    position: fixed;
+    right: 12px;
+    bottom: 12px;
+    z-index: 30;
+    background: rgb(0 0 0 / 55%);
+  }
+}

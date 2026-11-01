@@ -1,6 +1,10 @@
 import { computed, nextTick, reactive, shallowRef, watch } from "vue";
 import { invoke, isDesktop } from "./api";
 import {
+  browserGamepadFeedback,
+  createBrowserGamepadSource,
+} from "./gamepadBrowser";
+import {
   form,
   state,
   showPage,
@@ -85,6 +89,8 @@ export function gamepadFeedback(effect: Feedback | "stop") {
     (effect !== "stop" && (!gamepad.active || !form.gamepad.vibration))
   )
     return Promise.resolve();
+  if (!isDesktop())
+    return browserGamepadFeedback(gamepad.device.id, effect, form.gamepad);
   return invoke("gamepad_feedback", {
     deviceId: gamepad.device.id,
     effect,
@@ -670,6 +676,8 @@ export function createGamepadNavigation() {
 
 export function startGamepad() {
   const navigation = createGamepadNavigation();
+  // 桌面端由 Rust 读取 SDL 事件, 浏览器预览直接读 W3C Gamepad API.
+  const browser = isDesktop() ? null : createBrowserGamepadSource();
   const events = new AbortController();
   let stopped = false;
   let timer = 0;
@@ -735,10 +743,17 @@ export function startGamepad() {
     { signal: events.signal },
   );
   async function poll() {
-    const snapshot = await invoke("gamepad_poll").catch((error) => {
-      gamepad.deviceError = String(error);
-      return null;
-    });
+    let snapshot: GamepadSnapshot | null;
+    if (browser) {
+      snapshot = browser.poll(
+        form.gamepad.enabled && document.hasFocus() && !document.hidden,
+      );
+    } else {
+      snapshot = await invoke("gamepad_poll").catch((error) => {
+        gamepad.deviceError = String(error);
+        return null;
+      });
+    }
     if (stopped) return;
     if (snapshot) await accept(snapshot);
     timer = window.setTimeout(
@@ -801,7 +816,7 @@ export function startGamepad() {
     }
     navigation.refresh();
   }
-  if (isDesktop()) void poll();
+  void poll();
   return () => {
     stopped = true;
     clearTimeout(timer);

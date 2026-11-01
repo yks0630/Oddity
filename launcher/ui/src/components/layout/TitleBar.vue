@@ -1,7 +1,14 @@
 <script setup lang="ts">
 import { motion } from "motion-v";
 import NavigationRail from "./NavigationRail.vue";
-import { ui, state, openSettings, windowAction } from "../../core/controller";
+import { isDemo } from "../../core/demo";
+import {
+  ui,
+  state,
+  openSettings,
+  openDemoNotice,
+  windowAction,
+} from "../../core/controller";
 </script>
 
 <template>
@@ -34,7 +41,21 @@ import { ui, state, openSettings, windowAction } from "../../core/controller";
         <i class="status-dot status-dot--warn"></i>
         <span>需要配置</span>
       </motion.button>
-      <div class="win-controls">
+      <motion.button
+        v-if="isDemo"
+        :while-press="{ scale: 0.88 }"
+        class="demo-chip"
+        id="demo-chip"
+        type="button"
+        title="查看浏览器演示说明"
+        @click="openDemoNotice"
+      >
+        <svg class="icon" viewBox="0 0 256 256" aria-hidden="true">
+          <use href="#i-info"></use>
+        </svg>
+        <span>浏览器演示</span>
+      </motion.button>
+      <div v-if="!isDemo" class="win-controls">
         <motion.button
           :while-press="{ scale: 0.88 }"
           class="win-btn"
