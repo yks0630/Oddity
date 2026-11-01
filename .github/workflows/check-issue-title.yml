@@ -71,7 +71,7 @@ jobs:
 
             async function writeWarning(message) {
               try {
-                const body = `${marker}\n\n${message}`;
+                const body = `${marker}\n\n> 🤖 自动检查提示：本评论由机器人自动发送，不是维护者留言。\n\n${message}`;
                 const previous = await findWarnings();
                 if (previous.length === 0) {
                   await github.rest.issues.createComment({ ...issueParams, body });

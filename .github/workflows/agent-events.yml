@@ -29,10 +29,11 @@ jobs:
     name: 通知 dsh-superagent
     runs-on: ubuntu-latest
     steps:
-      - name: 处理事件并通知
+      - name: 转发事件并通知
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTOR: ${{ github.event.sender.login }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           RELEASE_URL: ${{ github.event.release.html_url }}
           RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
@@ -44,24 +45,48 @@ jobs:
           REQUESTED_REVIEWER: ${{ github.event.requested_reviewer.login }}
         run: |
           set -euo pipefail
+          actor="${EVENT_ACTOR:-未知账号}"
+
+          # 机器人只转发事件，不替维护者下指令：评论里不写实现方式、评审标准或验证要求，
+          # 授权与处理方式交给触发事件的标签/评审请求和 TypeRota 的仓库规则，避免通知与规则不一致。
+          comment_body() {
+            local kind="$1"
+            local event="$2"
+            printf '<!-- dsh-superagent:event:%s -->\n> 🤖 自动通知：本评论由 GitHub Actions 转发，仅说明触发事件，不是人工留言，也不是新的人工指令；授权与处理方式以该事件和仓库规则为准。\n\n事件：%s\n\n@TypeRota 请按仓库规则处理本次事件。\n' "$kind" "$event"
+          }
+
           if [ "$EVENT_NAME" = "issues" ]; then
-            if [ "$EVENT_LABEL" != "TypeRota: implement" ]; then
+            if [ "$EVENT_LABEL" = "TypeRota: implement" ]; then
+              gh issue comment "$EVENT_ISSUE" --repo "$GITHUB_REPOSITORY" \
+                --body "$(comment_body implement-issue "$actor 给本 Issue 添加了标签「TypeRota: implement」，请求实现本 Issue。")"
+            else
               echo "Skip label: $EVENT_LABEL"
-              exit 0
             fi
-            gh issue comment "$EVENT_ISSUE" --repo "$GITHUB_REPOSITORY" --body "@TypeRota 受理这个 Issue：请按仓库规则实现并提交 PR；如果需要设计决策，按仓库规则处理并等待维护者确认，不要在公开 Issue 中发布方案。"
             exit 0
           fi
+
           if [ "$EVENT_NAME" = "pull_request_target" ]; then
             if [ "$EVENT_LABEL" = "TypeRota: autofix" ]; then
-              gh pr comment "$EVENT_PR" --repo "$GITHUB_REPOSITORY" --body "@TypeRota 已启用 autofix：请修复这个 PR 的评审问题与 CI，修复后用 @coderabbitai review 触发复审，循环到可以进入合并阶段。"
-              exit 0
-            fi
-            if [ "$EVENT_LABEL" = "TypeRota: Review" ] || [ "$REQUESTED_REVIEWER" = "TypeRota" ]; then
-              gh pr comment "$EVENT_PR" --repo "$GITHUB_REPOSITORY" --body "@TypeRota 请评审这个 PR：给出具体问题、风险与验证建议；没有阻塞问题时可以批准。"
+              gh pr comment "$EVENT_PR" --repo "$GITHUB_REPOSITORY" \
+                --body "$(comment_body autofix-pull "$actor 给本 PR 添加了标签「TypeRota: autofix」，请求进入自动修复模式。")"
+            elif [ "$EVENT_LABEL" = "TypeRota: Review" ]; then
+              gh pr comment "$EVENT_PR" --repo "$GITHUB_REPOSITORY" \
+                --body "$(comment_body review-pull "$actor 给本 PR 添加了标签「TypeRota: Review」，请求评审本 PR。")"
+            elif [ "$REQUESTED_REVIEWER" = "TypeRota" ]; then
+              gh pr comment "$EVENT_PR" --repo "$GITHUB_REPOSITORY" \
+                --body "$(comment_body review-pull "$actor 请求 @TypeRota 评审本 PR。")"
+            else
+              echo "Skip pull_request_target event: label=$EVENT_LABEL reviewer=$REQUESTED_REVIEWER"
             fi
             exit 0
           fi
+
+          # 手动触发只保留入口，不转发事件：避免误建「每周记忆整理」Issue。
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Manual dispatch: no event is forwarded."
+            exit 0
+          fi
+
           if [ "$EVENT_NAME" = "workflow_run" ]; then
             tag="$RUN_BRANCH"
             case "$tag" in
@@ -69,27 +94,17 @@ jobs:
               *) echo "Skip non-release workflow run on $tag"; exit 0 ;;
             esac
             title="[agent] Release $tag 发布检查"
-            body=$(cat <<EOF
-          发布工作流状态：$RUN_CONCLUSION
-          工作流运行：$RUN_URL
-          Release 链接：https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag
-
-          请核对：release notes 与实际合并 PR、标签是否一致；AUR、Gentoo、Nix 打包是否成功；docs 版本引用是否需要更新。
-          EOF
-          )
+            body=$(printf '<!-- dsh-superagent:event:release-check -->\n> 🤖 自动通知：本 Issue 由 GitHub Actions 自动创建，是发布工作流的完成通知，不是人工请求；处理方式以仓库规则为准。\n\n发布工作流状态：%s\n工作流运行：%s\nRelease 链接：https://github.com/%s/releases/tag/%s\n触发者：%s\n' "$RUN_CONCLUSION" "$RUN_URL" "$GITHUB_REPOSITORY" "$tag" "$actor")
           elif [ "$EVENT_NAME" = "release" ]; then
             title="[agent] Release $RELEASE_TAG 发布检查"
-            body=$(cat <<EOF
-          Release: $RELEASE_URL
-          Tag: $RELEASE_TAG
-
-          请核对：release notes 与实际合并 PR、标签是否一致；AUR、Gentoo、Nix 打包是否成功；docs 版本引用是否需要更新。
-          EOF
-          )
-          else
+            body=$(printf '<!-- dsh-superagent:event:release-check -->\n> 🤖 自动通知：本 Issue 由 GitHub Actions 自动创建，是发布通知，不是人工请求；处理方式以仓库规则为准。\n\nRelease：%s\nTag：%s\n发布者：%s\n' "$RELEASE_URL" "$RELEASE_TAG" "$actor")
+          elif [ "$EVENT_NAME" = "schedule" ]; then
             date=$(date -u +%Y-%m-%d)
             title="[agent] 每周记忆整理 $date"
-            body="每周一次的记忆整理：把 journal 合并进 MEMORY.md，去重并保持 200 行以内。"
+            body=$(printf '<!-- dsh-superagent:event:memory-consolidate -->\n> 🤖 自动通知：本 Issue 由每周定时工作流自动创建，不是人工请求；处理方式以仓库规则为准。\n\n每周一次的记忆整理。\n')
+          else
+            echo "Unsupported event: $EVENT_NAME"
+            exit 0
           fi
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title $title" --json number,title | jq --arg t "$title" -r 'map(select(.title == $t)) | .[0].number // empty')
           if [ -n "$existing" ]; then
