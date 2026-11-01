@@ -904,8 +904,8 @@ const BUNDLED_VIDEO_CANDIDATES = [
   { url: "assets/hero-loop.mp4", type: 'video/mp4; codecs="avc1.42E01E"' },
   { url: "assets/hero-loop.webm", type: 'video/webm; codecs="vp9"' },
 ];
-let heroVideoRequest: Promise<boolean> | null = null;
-let heroImageRequest: Promise<void> | null = null;
+let heroVideoRequest: { key: string; promise: Promise<boolean> } | null = null;
+let heroImageRequest: { key: string; promise: Promise<void> } | null = null;
 let launcherBackground: LauncherBackgroundMedia = { ...EMPTY_BACKGROUND };
 let launcherBackgroundKey = "";
 let launcherBackgroundRequest: {
@@ -1012,13 +1012,37 @@ function refreshLauncherBackground(data: Bootstrap) {
   if (!isDesktop()) return;
   const key = heroBackgroundKey(data);
   if (key === launcherBackgroundKey) return;
-  releaseHeroMedia();
   const epoch = generation;
-  void resolveLauncherBackground().then(() => {
+  // 新素材就绪前保留旧背景, 避免停在二级界面时整窗闪成纯色.
+  void resolveLauncherBackground().then((source) => {
     if (epoch !== generation || key !== heroBackgroundKey()) return;
-    if (!launcherBackground.image) media.initialized = true;
-    if (ui.introDone && state.page === "home") applyHeroMedia(state.heroMedia);
+    if (launcherBackgroundKey !== key) {
+      // 读取失败保留当前背景; 首次进入没有可保留的, 用内置素材兜底.
+      if (!media.imageKey && !media.videoKey)
+        replaceHeroBackground(key, EMPTY_BACKGROUND);
+      return;
+    }
+    replaceHeroBackground(key, source);
   });
+}
+
+function replaceHeroBackground(key: string, source: LauncherBackgroundMedia) {
+  // 二级界面没有视频帧, 换图时先丢掉旧视频, 避免它盖住新的静态壁纸.
+  // 主页保留正在加载的视频, 由主视觉流程接着换片.
+  if (state.page !== "home") {
+    stopHeroVideo(videoElement);
+    media.url = "";
+    media.videoKey = "";
+    media.officialVideo = false;
+    media.loopCut = 1;
+    media.cropX = BUNDLED_CROP_X;
+    media.cropY = BUNDLED_CROP_Y;
+  }
+  media.imageKey = key;
+  media.image = source.image || "";
+  media.officialImage = Boolean(source.image);
+  media.initialized = true;
+  if (state.page === "home") applyHeroMedia(state.heroMedia);
 }
 
 async function loadHeroImage() {
@@ -1026,7 +1050,8 @@ async function loadHeroImage() {
   const epoch = generation;
   const key = heroBackgroundKey();
   if (!key || media.imageKey === key) return;
-  if (heroImageRequest) return heroImageRequest;
+  // 只复用同一地区的在途请求, 切换地区后旧请求不能占住新的加载入口.
+  if (heroImageRequest?.key === key) return heroImageRequest.promise;
 
   const promise = (async () => {
     const source = await resolveLauncherBackground();
@@ -1040,9 +1065,9 @@ async function loadHeroImage() {
     media.image = source.image;
     media.officialImage = true;
   })();
-  heroImageRequest = promise;
+  heroImageRequest = { key, promise };
   promise.finally(() => {
-    if (heroImageRequest === promise) heroImageRequest = null;
+    if (heroImageRequest?.promise === promise) heroImageRequest = null;
   });
   return promise;
 }
@@ -1051,7 +1076,8 @@ async function loadHeroVideo(video: HTMLVideoElement) {
   const epoch = generation;
   const key = heroBackgroundKey();
   if (media.url && media.videoKey === key) return true;
-  if (heroVideoRequest) return heroVideoRequest;
+  // 只复用同一地区的在途请求, 旧地区的请求完成后返回 false, 不能挡住新视频.
+  if (heroVideoRequest?.key === key) return heroVideoRequest.promise;
 
   const promise = (async () => {
     const source = await resolveLauncherBackground();
@@ -1081,9 +1107,9 @@ async function loadHeroVideo(video: HTMLVideoElement) {
     if (epoch !== generation || key !== heroBackgroundKey()) return false;
     return true;
   })().catch(() => false);
-  heroVideoRequest = promise;
+  heroVideoRequest = { key, promise };
   promise.finally(() => {
-    if (heroVideoRequest === promise) heroVideoRequest = null;
+    if (heroVideoRequest?.promise === promise) heroVideoRequest = null;
   });
   return promise;
 }
@@ -1141,8 +1167,10 @@ export function applyHeroMedia(input: string) {
   }
 
   const epoch = generation;
+  const key = heroBackgroundKey();
   loadHeroVideo(video).then((loaded) => {
-    if (epoch !== generation) return;
+    // 等待期间切换了地区时, 旧回调不能停掉新地区已开始的播放.
+    if (epoch !== generation || key !== heroBackgroundKey()) return;
     if (!loaded) {
       stopHeroVideo(video, state.page === "home");
       return;

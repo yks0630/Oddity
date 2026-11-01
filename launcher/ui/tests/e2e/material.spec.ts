@@ -8,7 +8,8 @@ interface Material {
   muted: string;
   background: string;
   alpha: number;
-  backdrop: string;
+  wallpaperFilter: string;
+  wallpaper: string;
   veil: string;
   contrast: number;
 }
@@ -49,7 +50,13 @@ async function readMaterial(page: Page, backdrop: number): Promise<Material> {
       );
     };
     const drawer = document.querySelector<HTMLElement>(".drawer")!;
-    const background = parse(getComputedStyle(drawer).backgroundColor)!;
+    const scrim = document.querySelector<HTMLElement>(".drawer__scrim")!;
+    const wallpaperRoot =
+      document.querySelector<HTMLElement>(".drawer__wallpaper")!;
+    const wallpaper = wallpaperRoot.querySelector<HTMLElement>(
+      ".wallpaper-fade__layer",
+    )!;
+    const background = parse(getComputedStyle(scrim).backgroundColor)!;
     const bone = parse(getComputedStyle(drawer).getPropertyValue("--bone"))!;
     const solid = {
       r: background.r * background.a + backdropValue * (1 - background.a),
@@ -65,11 +72,10 @@ async function readMaterial(page: Page, backdrop: number): Promise<Material> {
       accentText: root.getPropertyValue("--accent-text").trim(),
       bone: root.getPropertyValue("--bone").trim(),
       muted: root.getPropertyValue("--muted").trim(),
-      background: getComputedStyle(drawer).backgroundColor,
+      background: getComputedStyle(scrim).backgroundColor,
       alpha: background.a,
-      backdrop:
-        getComputedStyle(drawer).backdropFilter ||
-        getComputedStyle(drawer).getPropertyValue("-webkit-backdrop-filter"),
+      wallpaperFilter: getComputedStyle(wallpaperRoot).filter,
+      wallpaper: getComputedStyle(wallpaper).backgroundImage,
       veil: getComputedStyle(drawer, "::before").backgroundImage,
       contrast:
         (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05),
@@ -90,13 +96,20 @@ async function waitForTint(page: Page) {
     .toMatch(/^rgb\(\d+ \d+ \d+\)$/);
 }
 
-test("二级界面使用主视觉取色的磨砂材质并保持正文对比度", async ({ page }) => {
+test("二级界面使用主视觉取色的静态壁纸并保持正文对比度", async ({ page }) => {
   await page.goto("/");
   await expect(page.locator("#app")).toHaveClass(/is-intro-done/);
   await waitForTint(page);
   await page.locator('[data-page="settings"]').click();
   await expect(page.locator("#page-settings")).toBeVisible();
-  await expect(page.locator(".drawer")).toHaveCSS("backdrop-filter", /blur\(/);
+  await expect(page.locator(".drawer__wallpaper")).toHaveCSS(
+    "filter",
+    /blur\(/,
+  );
+  const appWallpaper = await page
+    .locator(".app__wallpaper .wallpaper-fade__layer")
+    .evaluate((element) => getComputedStyle(element).backgroundImage);
+  expect(appWallpaper).toContain("hero");
 
   const light = await readMaterial(page, 0);
   expect(light.tintLight).toMatch(/^rgb\(\d+ \d+ \d+\)$/);
@@ -105,7 +118,8 @@ test("二级界面使用主视觉取色的磨砂材质并保持正文对比度",
   expect(light.bone).toMatch(/^rgb\(\d+ \d+ \d+\)$/);
   expect(light.alpha).toBeGreaterThan(0.55);
   expect(light.alpha).toBeLessThan(0.68);
-  expect(light.backdrop).toContain("56px");
+  expect(light.wallpaperFilter).toContain("56px");
+  expect(light.wallpaper).toContain("hero");
   expect(light.veil).toContain("linear-gradient");
   expect(light.contrast).toBeGreaterThanOrEqual(4.5);
   expect(light.tintLight).not.toBe(light.tintDark);

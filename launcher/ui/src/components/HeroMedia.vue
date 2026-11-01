@@ -10,6 +10,9 @@ import {
   form,
   ui,
 } from "../core/controller";
+import WallpaperFade from "./WallpaperFade.vue";
+
+defineProps<{ wallpaper: string }>();
 
 const videoA = ref<HTMLVideoElement | null>(null);
 const videoB = ref<HTMLVideoElement | null>(null);
@@ -232,7 +235,12 @@ onBeforeUnmount(() => {
     }"
     :style="artStyle"
     aria-hidden="true"
-  ></div>
+  >
+    <WallpaperFade
+      :src="wallpaper"
+      :position="media.officialImage ? 'center' : '54% 38%'"
+    />
+  </div>
   <video
     id="hero-video"
     ref="videoA"

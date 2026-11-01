@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import {
+  computed,
   onBeforeUnmount,
   onMounted,
   watch,
@@ -8,7 +9,15 @@ import {
   useTemplateRef,
 } from "vue";
 import { MotionConfig, motion } from "motion-v";
-import { init, ui, form, state, showPage, dispose } from "./core/controller";
+import {
+  init,
+  ui,
+  form,
+  state,
+  media,
+  showPage,
+  dispose,
+} from "./core/controller";
 import { useSceneMotion, playerExpanded } from "./composables/useSceneMotion";
 import { useScenePalette } from "./composables/useScenePalette";
 import { navigationScrubbing } from "./composables/navigationGesture";
@@ -16,6 +25,7 @@ import NotificationCenter from "./components/NotificationCenter.vue";
 import IntegrityDialog from "./components/IntegrityDialog.vue";
 import TitleBar from "./components/layout/TitleBar.vue";
 import HeroMedia from "./components/HeroMedia.vue";
+import WallpaperFade from "./components/WallpaperFade.vue";
 import HomePage from "./pages/HomePage.vue";
 import UpdatePage from "./pages/UpdatePage.vue";
 import BulletinPage from "./pages/BulletinPage.vue";
@@ -33,6 +43,17 @@ const drawer = useTemplateRef<HTMLElement>("drawer");
 const shade = useTemplateRef<HTMLElement>("shade");
 const { opened } = useSceneMotion(scene, drawer, shade);
 useScenePalette();
+// 二级界面用当前静态主视觉做磨砂底, 不跟随视频帧或页面位移.
+const wallpaper = computed(() =>
+  media.image
+    ? media.image
+    : new URL(
+        state.heroMedia === "photo"
+          ? "assets/hero-keyart.jpg"
+          : "assets/hero-poster.jpg",
+        document.baseURI,
+      ).href,
+);
 const content = ref<HTMLElement | null>(null);
 watch(
   () => state.page,
@@ -85,8 +106,11 @@ onBeforeUnmount(() => {
         'gamepad-mode': gamepad.active,
       }"
     >
+      <div class="app__wallpaper" aria-hidden="true">
+        <WallpaperFade :src="wallpaper" />
+      </div>
       <div ref="scene" class="scene" aria-hidden="true">
-        <HeroMedia />
+        <HeroMedia :wallpaper="wallpaper" />
         <div class="hero__fade"></div>
       </div>
       <HomePage />
@@ -104,6 +128,10 @@ onBeforeUnmount(() => {
         :inert="!opened"
         :aria-hidden="!opened || undefined"
       >
+        <div class="drawer__wallpaper" aria-hidden="true">
+          <WallpaperFade :src="wallpaper" />
+        </div>
+        <div class="drawer__scrim" aria-hidden="true"></div>
         <motion.button
           class="drawer-close"
           type="button"

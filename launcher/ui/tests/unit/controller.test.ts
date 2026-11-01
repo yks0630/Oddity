@@ -2404,6 +2404,141 @@ it("切换地区后重新读取背景素材", async () => {
   expect(c.media.cropX).toBe(0.5);
 });
 
+it("切换地区时不复用旧地区的在途视频请求", async () => {
+  const cn = "http://127.0.0.1:4321/cn.mp4";
+  const global = "http://127.0.0.1:4321/global.mp4";
+  backend.background = { video: cn, image: null };
+  backend.data.settings = {
+    ...settings,
+    reduceMotion: false,
+    heroMedia: "video",
+  };
+  const base = backend.invoke.getMockImplementation()!;
+  let finishCn!: (source: LauncherBackgroundMedia) => void;
+  let calls = 0;
+  backend.invoke.mockImplementation((command: string, args: never) => {
+    if (command !== "launcher_background") return base(command, args);
+    if (calls++ === 0)
+      return new Promise<LauncherBackgroundMedia>((resolve) => {
+        finishCn = resolve;
+      });
+    return Promise.resolve<LauncherBackgroundMedia>({
+      video: global,
+      image: null,
+    });
+  });
+  const c = await boot();
+  const video = document.getElementById("hero-video") as HTMLVideoElement;
+  expect(c.media.url).toBe("");
+  expect(finishCn).toBeTypeOf("function");
+
+  backend.data.launcherRoot = "/games/global/launcher";
+  backend.data.settings = {
+    ...backend.data.settings,
+    distribution: "global",
+    globalInstallRoot: "/games/global",
+  };
+  c.form.distribution = "global";
+  c.form.globalInstallRoot = "/games/global";
+  await c.redetect();
+  await flushPromises();
+
+  expect(video.src).toBe(global);
+  // 旧地区的请求晚到也不能挡住或停掉新地区的视频.
+  finishCn({ video: cn, image: null });
+  await flushPromises();
+  expect(video.src).toBe(global);
+  expect(c.media.url).toBe(global);
+});
+
+it("在二级界面切换地区时保留旧背景直到新素材就绪", async () => {
+  const cn = "http://127.0.0.1:4321/cn-keyart.jpg";
+  const global = "http://127.0.0.1:4321/global-keyart.jpg";
+  backend.background = { video: null, image: cn };
+  backend.data.settings = {
+    ...settings,
+    reduceMotion: false,
+    heroMedia: "photo",
+  };
+  const c = await boot();
+  expect(c.media.image).toBe(cn);
+
+  c.showPage("update");
+  const base = backend.invoke.getMockImplementation()!;
+  let finish!: (source: LauncherBackgroundMedia) => void;
+  backend.invoke.mockImplementation((command: string, args: never) =>
+    command === "launcher_background"
+      ? new Promise<LauncherBackgroundMedia>((resolve) => {
+          finish = resolve;
+        })
+      : base(command, args),
+  );
+  backend.data.launcherRoot = "/games/global/launcher";
+  backend.data.settings = {
+    ...backend.data.settings,
+    distribution: "global",
+    globalInstallRoot: "/games/global",
+  };
+  c.form.distribution = "global";
+  c.form.globalInstallRoot = "/games/global";
+  const switching = c.redetect();
+  await flushPromises();
+  expect(finish).toBeTypeOf("function");
+  // 新地区的素材还没回来时, 二级界面仍应显示旧壁纸.
+  expect(c.media.image).toBe(cn);
+
+  finish({ video: null, image: global });
+  await switching;
+  await flushPromises();
+  expect(c.media.image).toBe(global);
+  expect(c.media.initialized).toBe(true);
+});
+
+it("背景读取失败时保留当前背景", async () => {
+  const cn = "http://127.0.0.1:4321/cn-keyart.jpg";
+  backend.background = { video: null, image: cn };
+  backend.data.settings = {
+    ...settings,
+    reduceMotion: false,
+    heroMedia: "photo",
+  };
+  const c = await boot();
+  c.showPage("update");
+  const base = backend.invoke.getMockImplementation()!;
+  backend.invoke.mockImplementation((command: string, args: never) =>
+    command === "launcher_background"
+      ? Promise.reject(new Error("offline"))
+      : base(command, args),
+  );
+  backend.data.launcherRoot = "/games/global/launcher";
+  backend.data.settings = {
+    ...backend.data.settings,
+    distribution: "global",
+    globalInstallRoot: "/games/global",
+  };
+  c.form.distribution = "global";
+  c.form.globalInstallRoot = "/games/global";
+  await c.redetect();
+  await flushPromises();
+
+  expect(c.media.image).toBe(cn);
+  expect(c.media.initialized).toBe(true);
+});
+
+it("首次读取背景失败时回退内置壁纸", async () => {
+  const base = backend.invoke.getMockImplementation()!;
+  backend.invoke.mockImplementation((command: string, args: never) =>
+    command === "launcher_background"
+      ? Promise.reject(new Error("offline"))
+      : base(command, args),
+  );
+  const c = await boot();
+
+  expect(c.media.initialized).toBe(true);
+  expect(c.media.image).toBe("");
+  expect(c.media.officialImage).toBe(false);
+});
+
 it("在视频结尾切换到预载的备播元素", async () => {
   backend.data.settings = {
     ...settings,

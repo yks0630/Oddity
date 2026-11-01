@@ -73,7 +73,7 @@ let minimized = false;
 let settings: Bootstrap["settings"] | undefined;
 let pendingShow = false;
 let mediaRevision = 0;
-let media: LauncherBackgroundMedia = { video: null, image: null };
+const mediaByRevision = new Map<number, LauncherBackgroundMedia>();
 const knownCommands = new Set<string>(Object.keys(commands));
 
 function authorized(event: Electron.IpcMainInvokeEvent) {
@@ -248,6 +248,8 @@ async function start() {
       if (!file.startsWith(uiRoot + sep))
         return new Response(null, { status: 403 });
     } else if (url.hostname === "media") {
+      const media = mediaByRevision.get(Number(url.searchParams.get("v")));
+      if (!media) return new Response(null, { status: 404 });
       const candidate =
         url.pathname === "/video"
           ? media.video
@@ -339,11 +341,13 @@ async function start() {
     )
       settings = (result as Bootstrap).settings;
     if (command === "launcher_background") {
-      media = result as LauncherBackgroundMedia;
-      mediaRevision++;
+      const background = result as LauncherBackgroundMedia;
+      const revision = ++mediaRevision;
+      // 每次回复绑定自己的版本, 并发完成时旧 URL 仍读回旧文件.
+      mediaByRevision.set(revision, background);
       return {
-        video: media.video ? `oddity://media/video?v=${mediaRevision}` : null,
-        image: media.image ? `oddity://media/image?v=${mediaRevision}` : null,
+        video: background.video ? `oddity://media/video?v=${revision}` : null,
+        image: background.image ? `oddity://media/image?v=${revision}` : null,
       };
     }
     return result;
