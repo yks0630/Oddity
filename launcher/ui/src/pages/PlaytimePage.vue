@@ -113,7 +113,6 @@ const isActive = computed(() => state.page === "records");
     <header class="page-head playtime-head">
       <div class="page-head__copy">
         <h2 id="records-title" tabindex="-1">游玩记录</h2>
-        <p>计时从游戏进程出现开始, 到游戏退出结束. 记录仅保存在本机.</p>
       </div>
       <div class="page-head__actions">
         <BaseButton
@@ -203,6 +202,11 @@ const isActive = computed(() => state.page === "records");
 <style scoped>
 .playtime-page {
   gap: 18px;
+  /* 内容仍可滚动, 只是不需要常驻的滚动条. */
+  scrollbar-width: none;
+}
+.playtime-page::-webkit-scrollbar {
+  display: none;
 }
 .playtime-head {
   align-items: flex-start;
