@@ -49,7 +49,7 @@ jobs:
               echo "Skip label: $EVENT_LABEL"
               exit 0
             fi
-            gh issue comment "$EVENT_ISSUE" --repo "$GITHUB_REPOSITORY" --body "@TypeRota 受理这个 Issue：请按仓库规则实现并提交 PR；如果范围或设计不明确，先留下方案与问题并停下。"
+            gh issue comment "$EVENT_ISSUE" --repo "$GITHUB_REPOSITORY" --body "@TypeRota 受理这个 Issue：请按仓库规则实现并提交 PR；如果需要设计决策，按仓库规则处理并等待维护者确认，不要在公开 Issue 中发布方案。"
             exit 0
           fi
           if [ "$EVENT_NAME" = "pull_request_target" ]; then
