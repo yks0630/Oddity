@@ -151,3 +151,20 @@ test("二级界面使用主视觉取色的静态壁纸并保持正文对比度",
   await page.locator("#set-adaptive-theme").check();
   await waitForTint(page);
 });
+
+test("窗口与抽屉不会被程序化滚动带偏", async ({ page }) => {
+  await page.goto("/#game-mode");
+  await expect(page.locator("#page-game-mode")).toBeVisible();
+  const title = page.locator("#game-mode-title");
+  const before = (await title.boundingBox())!.y;
+  // 复现 CI 里 scrollIntoView 造成的滚动量: 窗口 73 + 抽屉 30 = 103px。
+  const scrolled = await page.evaluate(() => {
+    const app = document.querySelector<HTMLElement>(".app")!;
+    const drawer = document.querySelector<HTMLElement>(".drawer")!;
+    app.scrollTop = 103;
+    drawer.scrollTop = 30;
+    return { app: app.scrollTop, drawer: drawer.scrollTop };
+  });
+  expect(scrolled).toEqual({ app: 0, drawer: 0 });
+  expect((await title.boundingBox())!.y).toBe(before);
+});

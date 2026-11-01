@@ -6,7 +6,9 @@
   position: relative;
   isolation: isolate;
   height: 100dvh;
+  /* 放大壁纸会撑出可滚动区域, 窗口必须只是裁切层, 不能被滚走。 */
   overflow: hidden;
+  overflow: clip;
   border: 1px solid var(--window-border);
   border-radius: var(--window-radius);
   background: var(--hero-bg);
@@ -183,7 +185,9 @@
   box-shadow:
     var(--glass-shadow),
     inset 0 1px 0 var(--glass-highlight);
+  /* 同上: 抽屉内的聚焦或 scrollIntoView 不能把整块内容滚走。 */
   overflow: hidden;
+  overflow: clip;
   transform: translateX(110%);
   will-change: transform;
 }
