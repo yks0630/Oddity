@@ -18,10 +18,14 @@ beforeEach(() => {
     "DOMMatrixReadOnly",
     class {
       m41 = 0;
+      m42 = 0;
       constructor(value: string) {
-        this.m41 = Number(
-          /matrix\([^,]+,[^,]+,[^,]+,[^,]+,\s*([-.\d]+)/.exec(value)?.[1] ?? 0,
-        );
+        const matrix =
+          /matrix\([^,]+,[^,]+,[^,]+,[^,]+,\s*([-.\d]+),\s*([-.\d]+)/.exec(
+            value,
+          );
+        this.m41 = Number(matrix?.[1] ?? 0);
+        this.m42 = Number(matrix?.[2] ?? 0);
       }
     },
   );

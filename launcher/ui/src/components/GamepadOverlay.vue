@@ -30,6 +30,89 @@ const spring = computed(() =>
     : { type: "spring" as const, stiffness: 410, damping: 25, mass: 0.8 },
 );
 let measuredOwner: HTMLElement | null = null;
+// 容器入场位移会把目标的实时矩形整体带偏, 定位时换算回容器稳定后的位置.
+const transformEffects = new WeakMap<object, boolean>();
+function shiftsGeometry(effect: KeyframeEffect): boolean {
+  let shifts = transformEffects.get(effect);
+  if (shifts === undefined) {
+    shifts = false;
+    try {
+      shifts = effect.getKeyframes().some((frame) => "transform" in frame);
+    } catch {
+      shifts = false;
+    }
+    transformEffects.set(effect, shifts);
+  }
+  return shifts;
+}
+function settledRect(target: HTMLElement): DOMRect {
+  const rect = target.getBoundingClientRect();
+  let x = 0;
+  let y = 0;
+  for (
+    let element = target.parentElement;
+    element && element !== document.body;
+    element = element.parentElement
+  ) {
+    const running = (element.getAnimations?.() ?? []).some(
+      (animation) =>
+        animation.playState === "running" &&
+        animation.effect &&
+        "getKeyframes" in animation.effect &&
+        // 无限动画不会停到稳定位置, 不参与换算.
+        Number.isFinite(Number(animation.effect.getComputedTiming().endTime)) &&
+        shiftsGeometry(animation.effect as KeyframeEffect),
+    );
+    if (!running) continue;
+    const { transform } = getComputedStyle(element);
+    if (!transform || transform === "none") continue;
+    const matrix = new DOMMatrixReadOnly(transform);
+    x += matrix.m41;
+    y += matrix.m42;
+  }
+  if (!x && !y) return rect;
+  return new DOMRect(rect.left - x, rect.top - y, rect.width, rect.height);
+}
+function follow(next: { x: number; y: number; width: number; height: number }) {
+  const owner = gamepadTarget.value;
+  if (measuredOwner !== owner) {
+    measuredOwner = owner ?? null;
+    timeline?.cancel();
+    const horizontal = box.value
+      ? Math.abs(next.x - box.value.x) > Math.abs(next.y - box.value.y)
+      : false;
+    const distance = box.value
+      ? Math.hypot(next.x - box.value.x, next.y - box.value.y)
+      : 0;
+    const amount = reduced.value ? 0 : distance > 250 ? 0.025 : 0.055;
+    shape.value = {
+      scaleX: horizontal ? 1 + amount : 1 - amount / 2,
+      scaleY: horizontal ? 1 - amount / 2 : 1 + amount,
+    };
+    detail.value = false;
+    timeline = createTimeline();
+    timeline.call(
+      () => {
+        detail.value = true;
+      },
+      reduced.value ? 0 : 30,
+    );
+    timeline.call(
+      () => {
+        shape.value = { scaleX: 1, scaleY: 1 };
+      },
+      reduced.value ? 0 : 85,
+    );
+  }
+  if (
+    !box.value ||
+    Object.entries(next).some(
+      ([key, value]) =>
+        Math.abs(box.value![key as keyof typeof next] - value) > 0.25,
+    )
+  )
+    box.value = next;
+}
 function measure() {
   frame = 0;
   const owner = gamepadTarget.value;
@@ -60,7 +143,7 @@ function measure() {
     target?.isConnected &&
     !target.closest('[inert],[hidden],[aria-hidden="true"]')
   ) {
-    const rect = target.getBoundingClientRect();
+    const rect = settledRect(target);
     const viewport = gamepadViewport(target);
     clip.value = `inset(${Math.max(0, viewport.top)}px 0 ${Math.max(0, innerHeight - viewport.bottom)}px 0)`;
     if (
@@ -75,43 +158,7 @@ function measure() {
         width: rect.width + 10,
         height: rect.height + 8,
       };
-      if (measuredOwner !== owner) {
-        measuredOwner = owner ?? null;
-        timeline?.cancel();
-        const horizontal = box.value
-          ? Math.abs(next.x - box.value.x) > Math.abs(next.y - box.value.y)
-          : false;
-        const distance = box.value
-          ? Math.hypot(next.x - box.value.x, next.y - box.value.y)
-          : 0;
-        const amount = reduced.value ? 0 : distance > 250 ? 0.025 : 0.055;
-        shape.value = {
-          scaleX: horizontal ? 1 + amount : 1 - amount / 2,
-          scaleY: horizontal ? 1 - amount / 2 : 1 + amount,
-        };
-        detail.value = false;
-        timeline = createTimeline();
-        timeline.call(
-          () => {
-            detail.value = true;
-          },
-          reduced.value ? 0 : 30,
-        );
-        timeline.call(
-          () => {
-            shape.value = { scaleX: 1, scaleY: 1 };
-          },
-          reduced.value ? 0 : 85,
-        );
-      }
-      if (
-        !box.value ||
-        Object.entries(next).some(
-          ([key, value]) =>
-            Math.abs(box.value![key as keyof typeof next] - value) > 0.25,
-        )
-      )
-        box.value = next;
+      follow(next);
     } else box.value = null;
   } else box.value = null;
   // 过渡中的目标仍逐帧跟随, 静止后等待布局事件。

@@ -85,3 +85,75 @@ it("静止时停止测量, 滚动、尺寸和过渡变化重新跟随, 浏览图
   await vi.advanceTimersByTimeAsync(100);
   expect(bounds).toHaveBeenCalledTimes(unmounted);
 });
+
+it("容器位移动画期间按稳定位置定位, 非位移过渡仍逐帧跟随", async () => {
+  let animations: Animation[] = [];
+  Object.defineProperty(Element.prototype, "getAnimations", {
+    configurable: true,
+    value: () => animations,
+  });
+  const animation = (keyframes: Record<string, unknown>[]) =>
+    ({
+      playState: "running",
+      effect: {
+        getKeyframes: () => keyframes,
+        getComputedTiming: () => ({ endTime: 520 }),
+      },
+    }) as unknown as Animation;
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      disconnect() {}
+    },
+  );
+  document.body.innerHTML =
+    '<section class="page is-active"><div data-pad-region></div><div class="drawer"><button id="first"></button><button id="second"></button></div></section>';
+  const home = document.querySelector<HTMLElement>("[data-pad-region]")!;
+  const drawer = document.querySelector<HTMLElement>(".drawer")!;
+  const first = document.querySelector<HTMLElement>("#first")!;
+  const second = document.querySelector<HTMLElement>("#second")!;
+  vi.spyOn(home, "getBoundingClientRect").mockReturnValue(
+    new DOMRect(40, 200, 500, 100),
+  );
+  // 抽屉滑入时整体右移 800px, 目标的稳定位置是 (400, 120).
+  let sliding = true;
+  vi.spyOn(first, "getBoundingClientRect").mockImplementation(() =>
+    sliding ? new DOMRect(1200, 120, 152, 44) : new DOMRect(400, 120, 152, 44),
+  );
+  vi.spyOn(second, "getBoundingClientRect").mockReturnValue(
+    new DOMRect(400, 300, 100, 40),
+  );
+  gamepadTarget.value = home;
+  gamepad.active = true;
+  const wrapper = mount(GamepadOverlay, { attachTo: document.body });
+  await vi.advanceTimersByTimeAsync(200);
+  const select = document.querySelector<HTMLElement>(".gamepad-select")!;
+  expect(select.style.transform).toContain("translateX(35px)");
+
+  // 滑入动画期间按稳定位置定位, 不等动画结束.
+  drawer.style.transform = "matrix(1, 0, 0, 1, 800, 0)";
+  animations = [animation([{ transform: "translateX(110%)" }])];
+  gamepadTarget.value = first;
+  await nextTick();
+  await vi.advanceTimersByTimeAsync(200);
+  expect(select.style.transform).toContain("translateX(395px)");
+  expect(select.style.transform).toContain("translateY(116px)");
+
+  // 动画结束后目标回到布局位置, 选中框不跳动.
+  animations = [];
+  sliding = false;
+  drawer.style.transform = "matrix(1, 0, 0, 1, 0, 0)";
+  document.dispatchEvent(new Event("scroll"));
+  await vi.advanceTimersByTimeAsync(200);
+  expect(select.style.transform).toContain("translateX(395px)");
+
+  // 仅透明度过渡时仍按实时矩形定位.
+  animations = [animation([{ opacity: 0 }])];
+  gamepadTarget.value = second;
+  await nextTick();
+  await vi.advanceTimersByTimeAsync(200);
+  expect(select.style.transform).toContain("translateY(296px)");
+
+  wrapper.unmount();
+});
