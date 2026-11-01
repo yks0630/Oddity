@@ -1,0 +1,44 @@
+name: 夜间检查失败提醒
+
+on:
+  workflow_run:
+    workflows:
+      - 前端质量检查
+      - Rust 质量检查
+      - 构建并打包
+    branches:
+      - main
+    types:
+      - completed
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  notify:
+    name: 记录夜间检查失败
+    if: >-
+      github.event.workflow_run.event == 'schedule' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 创建或追加失败记录
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          title="[nightly] ${WORKFLOW_NAME} 在 main 上失败"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label ci --limit 100 --json number,title \
+            | jq --arg t "$title" -r 'map(select(.title == $t)) | .[0].number // empty')
+          body=$(printf '工作流：%s\n提交：https://github.com/%s/commit/%s\n运行：%s\n' \
+            "$WORKFLOW_NAME" "$GITHUB_REPOSITORY" "$RUN_SHA" "$RUN_URL")
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "同一工作流再次失败：$RUN_URL"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --label ci
+          fi

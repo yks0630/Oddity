@@ -2,9 +2,9 @@ name: 前端质量检查
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
+  schedule:
+    # 每天 03:00 (UTC+8) 在 main 上跑一次全量，PR 仍按改动路径筛选。
+    - cron: '0 19 * * *'
   workflow_dispatch:
 
 permissions:
@@ -82,12 +82,36 @@ jobs:
         working-directory: launcher/ui
       - run: pnpm run test:e2e
         working-directory: launcher/ui
+      - name: 检查 e2e 失败现场
+        id: e2e-artifacts
+        if: ${{ !cancelled() }}
+        run: |
+          found=false
+          if [ -d launcher/ui/test-results ] && [ -n "$(find launcher/ui/test-results \( -name 'error-context.md' -o -name 'trace.zip' \) -print -quit)" ]; then
+            found=true
+          fi
+          echo "found=$found" >> "$GITHUB_OUTPUT"
+      - name: 上传 e2e 失败现场
+        if: ${{ !cancelled() && steps.e2e-artifacts.outputs.found == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-e2e-failures
+          path: launcher/ui/test-results/
+          if-no-files-found: ignore
       - name: 构建浏览器演示
         run: pnpm run build:demo
         working-directory: launcher/ui
       - name: 浏览器演示冒烟测试
+        id: demo
         run: pnpm run test:demo
         working-directory: launcher/ui
+      - name: 上传演示测试失败现场
+        if: ${{ !cancelled() && steps.demo.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-demo-failures
+          path: launcher/ui/test-results/
+          if-no-files-found: ignore
       - name: 安装原生测试依赖
         uses: ./.github/actions/install-linux-deps
       - uses: dtolnay/rust-toolchain@stable
@@ -108,6 +132,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y openbox
           xvfb-run -a dbus-run-session sh -c 'openbox >/tmp/oddity-wm.log 2>&1 & pnpm run test:desktop'
+
+      - name: 上传桌面测试失败现场
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-desktop-failures
+          path: launcher/ui/test-results-desktop/
+          if-no-files-found: ignore
 
   audit:
     needs: changes

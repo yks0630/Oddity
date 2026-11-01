@@ -2,9 +2,9 @@ name: 构建并打包
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
+  schedule:
+    # 每天 03:00 (UTC+8) 在 main 上跑一次全量，PR 仍按改动路径筛选。
+    - cron: '0 19 * * *'
   workflow_dispatch:
   workflow_call:
     inputs:
