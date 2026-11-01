@@ -53,6 +53,10 @@ jobs:
             exit 0
           fi
           if [ "$EVENT_NAME" = "pull_request_target" ]; then
+            if [ "$EVENT_LABEL" = "TypeRota: autofix" ]; then
+              gh pr comment "$EVENT_PR" --repo "$GITHUB_REPOSITORY" --body "@TypeRota 已启用 autofix：请修复这个 PR 的评审问题与 CI，修复后用 @coderabbitai review 触发复审，循环到可以进入合并阶段。"
+              exit 0
+            fi
             if [ "$EVENT_LABEL" = "TypeRota: Review" ] || [ "$REQUESTED_REVIEWER" = "TypeRota" ]; then
               gh pr comment "$EVENT_PR" --repo "$GITHUB_REPOSITORY" --body "@TypeRota 请评审这个 PR：给出具体问题、风险与验证建议；没有阻塞问题时可以批准。"
             fi
