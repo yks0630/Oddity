@@ -39,6 +39,18 @@ Oddity 通过 `umu-run` 和 Proton 管理游戏运行环境，并集成了资源
 **更多体验**
 - 官方公告、游玩记录、分享海报与主流手柄支持。
 
+## _Try It_
+
+无需安装，即可在浏览器中体验 Oddity。
+
+**[在线试用 Oddity](https://lat-sky.github.io/Oddity/)**
+
+在线演示保留了启动器的主要界面与交互，使用模拟数据运行。
+
+游戏安装、资源下载、更新、登录及签到等实际操作仅在桌面版中可用。
+
+更多信息参见[浏览器演示文档](docs/demo.md)。
+
 ## _Installation_
 
 从 [Releases](https://github.com/LaT-SKY/Oddity/releases) 下载对应安装包：
