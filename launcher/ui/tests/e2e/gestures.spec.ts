@@ -5,6 +5,12 @@ async function center(page: Page, selector: string) {
   expect(box).not.toBeNull();
   return { x: box!.x + box!.width / 2, y: box!.y + box!.height / 2 };
 }
+async function openDrawer(page: Page, hash: string, selector: string) {
+  await page.goto(`/#${hash}`);
+  await expect(page.locator(selector)).toBeVisible();
+  // 抽屉入场是 520ms 弹簧, 等落位后再取坐标, 否则拖动的起点会落在内容上。
+  await page.waitForTimeout(650);
+}
 async function readyNotice(page: Page) {
   await page.goto("/");
   await expect(page.locator(".notification-stack")).toHaveAttribute(
@@ -224,6 +230,181 @@ test("导航键盘焦点连续移动，失焦会取消拖动", async ({ page }) 
   await page.dispatchEvent("body", "blur", { bubbles: true });
   await page.mouse.up();
   await expect(home).toHaveAttribute("aria-current", "page");
+});
+
+test("按住设置分类条拖动切类, Escape 取消回到原类", async ({ page }) => {
+  await openDrawer(
+    page,
+    "settings",
+    '#page-settings [data-category="appearance"]',
+  );
+  const nav = page.locator("#page-settings .settings-categories");
+  const appearance = await center(
+    page,
+    '#page-settings [data-category="appearance"]',
+  );
+  const runtime = await center(
+    page,
+    '#page-settings [data-category="runtime"]',
+  );
+  const gamepad = await center(
+    page,
+    '#page-settings [data-category="gamepad"]',
+  );
+  await page.mouse.move(appearance.x, appearance.y);
+  await page.mouse.down();
+  await page.mouse.move(runtime.x, runtime.y, { steps: 14 });
+  await expect(
+    page.locator('#page-settings [data-category="runtime"]'),
+  ).toHaveAttribute("aria-current", "true");
+  await expect(nav).toHaveAttribute("data-scrubbing", "true");
+  await page.mouse.up();
+  await expect(page.locator("#settings-panel-runtime")).toBeVisible();
+  await expect(nav).toHaveAttribute("data-scrubbing", "false");
+  await expect(
+    page.locator('#page-settings [data-category="runtime"]'),
+  ).toBeFocused();
+
+  await page.mouse.move(runtime.x, runtime.y);
+  await page.mouse.down();
+  await page.mouse.move(gamepad.x, gamepad.y, { steps: 10 });
+  await expect(
+    page.locator('#page-settings [data-category="gamepad"]'),
+  ).toHaveAttribute("aria-current", "true");
+  await page.keyboard.press("Escape");
+  await page.mouse.up();
+  await expect(
+    page.locator('#page-settings [data-category="runtime"]'),
+  ).toHaveAttribute("aria-current", "true");
+  await expect(nav).toHaveAttribute("data-scrubbing", "false");
+  await expect(page.locator("#settings-panel-runtime")).toBeVisible();
+});
+
+test("按住游戏模式分类条拖动切类", async ({ page }) => {
+  await openDrawer(
+    page,
+    "game-mode",
+    '#page-game-mode [data-category="general"]',
+  );
+  const general = await center(
+    page,
+    '#page-game-mode [data-category="general"]',
+  );
+  const gamescope = await center(
+    page,
+    '#page-game-mode [data-category="gamescope"]',
+  );
+  await page.mouse.move(general.x, general.y);
+  await page.mouse.down();
+  await page.mouse.move(gamescope.x, gamescope.y, { steps: 14 });
+  await expect(
+    page.locator('#page-game-mode [data-category="gamescope"]'),
+  ).toHaveAttribute("aria-current", "true");
+  await page.mouse.up();
+  await expect(page.locator("#game-mode-panel-gamescope")).toBeVisible();
+});
+
+test("按住公告分类条拖动切换", async ({ page }) => {
+  await openDrawer(page, "bulletin", '.bulletin-filters [data-value="all"]');
+  const all = await center(page, '.bulletin-filters [data-value="all"]');
+  const maintenance = await center(
+    page,
+    '.bulletin-filters [data-value="maintenance"]',
+  );
+  await page.mouse.move(all.x, all.y);
+  await page.mouse.down();
+  await page.mouse.move(maintenance.x, maintenance.y, { steps: 14 });
+  await expect(
+    page.locator('.bulletin-filters [data-value="maintenance"]'),
+  ).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator(".bulletin-filters")).toHaveAttribute(
+    "data-scrubbing",
+    "true",
+  );
+  await page.mouse.up();
+  await expect(page.locator(".bulletin-filters")).toHaveAttribute(
+    "data-scrubbing",
+    "false",
+  );
+});
+
+test("搜索时设置分类条不进入拖动", async ({ page }) => {
+  await openDrawer(
+    page,
+    "settings",
+    '#page-settings [data-category="appearance"]',
+  );
+  const search = page.getByRole("searchbox", { name: "搜索设置" });
+  await search.fill("路径");
+  const appearance = await center(
+    page,
+    '#page-settings [data-category="appearance"]',
+  );
+  const runtime = await center(
+    page,
+    '#page-settings [data-category="runtime"]',
+  );
+  await page.mouse.move(appearance.x, appearance.y);
+  await page.mouse.down();
+  await page.mouse.move(runtime.x, runtime.y, { steps: 10 });
+  await expect(
+    page.locator("#page-settings .settings-categories"),
+  ).toHaveAttribute("data-scrubbing", "false");
+  await page.mouse.move(runtime.x + 240, runtime.y);
+  await page.mouse.up();
+  await expect(search).toHaveValue("路径");
+  await expect(page.locator("#page-settings .settings-result")).toHaveCount(2);
+});
+
+test("触摸拖动设置分类条也能切类", async ({ browser }) => {
+  const context = await browser.newContext({
+    hasTouch: true,
+    viewport: { width: 1180, height: 760 },
+  });
+  const page = await context.newPage();
+  await page.goto(
+    `${
+      test.info().project.use.baseURL ??
+      `http://127.0.0.1:${process.env.ODDITY_PREVIEW_PORT || "4173"}`
+    }/#settings`,
+  );
+  await expect(
+    page.locator('#page-settings [data-category="appearance"]'),
+  ).toBeVisible();
+  await page.waitForTimeout(650);
+  const appearance = await center(
+    page,
+    '#page-settings [data-category="appearance"]',
+  );
+  const runtime = await center(
+    page,
+    '#page-settings [data-category="runtime"]',
+  );
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchStart",
+    touchPoints: [{ ...appearance, id: 1 }],
+  });
+  for (let step = 1; step <= 14; step++) {
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [
+        {
+          x: appearance.x + ((runtime.x - appearance.x) * step) / 14,
+          y: appearance.y + ((runtime.y - appearance.y) * step) / 14,
+          id: 1,
+        },
+      ],
+    });
+  }
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchEnd",
+    touchPoints: [],
+  });
+  await expect(
+    page.locator('#page-settings [data-category="runtime"]'),
+  ).toHaveAttribute("aria-current", "true");
+  await context.close();
 });
 
 test("触摸手势保留通知组纵向滚动，并支持通知与导航横滑", async ({

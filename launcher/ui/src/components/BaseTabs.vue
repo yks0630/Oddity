@@ -1,7 +1,8 @@
 <script setup lang="ts" generic="T extends string">
-import { useId } from "vue";
+import { ref, useId } from "vue";
 import { motion } from "motion-v";
 import { useControlMotion } from "../composables/useControlMotion";
+import { useScrubNavigation } from "../composables/useScrubNavigation";
 const props = defineProps<{
   modelValue: T;
   options: readonly { value: T; label: string; disabled?: boolean }[];
@@ -9,6 +10,7 @@ const props = defineProps<{
   disabled?: boolean;
   controls?: string;
   variant?: "segmented" | "navigation";
+  scrubbable?: boolean;
 }>();
 const emit = defineEmits<{
   "update:modelValue": [value: T];
@@ -16,11 +18,29 @@ const emit = defineEmits<{
 }>();
 const uid = useId();
 const { control } = useControlMotion();
+const root = ref<HTMLElement | null>(null);
+const scrubbing = ref(false);
+const { down, lost, suppressed } = useScrubNavigation({
+  root,
+  item: ".control-tabs__tab:not(:disabled)",
+  value: (element) => element.dataset.value,
+  active: () => props.modelValue,
+  select: (value) => choose(value as T),
+  axis: "x",
+  enabled: () => props.scrubbable === true && !props.disabled,
+  focusOnFinish: true,
+  scrollIntoView: true,
+  scrubbing,
+});
 function choose(value: T) {
   if (value !== props.modelValue) {
     emit("update:modelValue", value);
     emit("change", value);
   }
+}
+function click(event: MouseEvent, value: T) {
+  if (suppressed(event)) return;
+  choose(value);
 }
 function keydown(event: KeyboardEvent) {
   if (
@@ -50,11 +70,18 @@ function keydown(event: KeyboardEvent) {
 </script>
 <template>
   <div
+    ref="root"
     class="control-tabs"
-    :class="{ 'control-tabs--navigation': variant === 'navigation' }"
+    :class="{
+      'control-tabs--navigation': variant === 'navigation',
+      'control-tabs--scrubbable': scrubbable,
+    }"
+    :data-scrubbing="scrubbable ? scrubbing : undefined"
     role="tablist"
     :aria-label="label"
     @keydown="keydown"
+    @pointerdown="down"
+    @lostpointercapture="lost"
   >
     <button
       v-for="option in options"
@@ -64,10 +91,11 @@ function keydown(event: KeyboardEvent) {
       class="control-tabs__tab"
       :class="{ 'category-tab': variant === 'navigation' }"
       :disabled="disabled || option.disabled"
+      :data-value="option.value"
       :aria-selected="modelValue === option.value"
       :aria-controls="controls"
       :tabindex="modelValue === option.value ? 0 : -1"
-      @click="choose(option.value)"
+      @click="click($event, option.value)"
     >
       <motion.span
         v-if="modelValue === option.value"

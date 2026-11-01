@@ -22,6 +22,7 @@ import {
   type SettingsEntry,
 } from "../core/settingsCatalog";
 import { useControlMotion } from "../composables/useControlMotion";
+import { useScrubNavigation } from "../composables/useScrubNavigation";
 import RuntimeEnvironments from "../components/RuntimeEnvironments.vue";
 import TaygedoSettings from "../components/TaygedoSettings.vue";
 import BaseSelect from "../components/BaseSelect.vue";
@@ -189,6 +190,28 @@ const entry = (id: SettingsEntry["id"]) =>
 function chooseCategory(category: SettingsCategory) {
   navigation.category = category;
   navigation.query = "";
+}
+const categoriesNav = ref<HTMLElement | null>(null);
+const categoryScrubbing = ref(false);
+const {
+  down: categoryDown,
+  lost: categoryLost,
+  suppressed: categorySuppressed,
+} = useScrubNavigation({
+  root: categoriesNav,
+  item: "[data-category]",
+  value: (element) => element.dataset.category,
+  active: () => navigation.category,
+  select: (value) => chooseCategory(value as SettingsCategory),
+  axis: "auto",
+  enabled: () => !searching.value,
+  focusOnFinish: true,
+  scrollIntoView: true,
+  scrubbing: categoryScrubbing,
+});
+function clickCategory(event: MouseEvent, category: SettingsCategory) {
+  if (categorySuppressed(event)) return;
+  chooseCategory(category);
 }
 async function locate(item: SettingsEntry) {
   visited.add(item.category);
@@ -408,9 +431,14 @@ const integritySummary = computed(() => {
       </div>
       <div class="settings-frame">
         <nav
+          ref="categoriesNav"
           class="settings-categories"
+          :class="{ 'is-scrubbable': !searching }"
           aria-label="设置分类"
+          :data-scrubbing="categoryScrubbing"
           @keydown="categoryKeys"
+          @pointerdown="categoryDown"
+          @lostpointercapture="categoryLost"
         >
           <motion.button
             v-for="category in settingsCategories"
@@ -427,7 +455,7 @@ const integritySummary = computed(() => {
             :while-press="reduced ? undefined : { scale: 0.97 }"
             :transition="control"
             :aria-controls="`settings-panel-${category.id}`"
-            @click="chooseCategory(category.id)"
+            @click="clickCategory($event, category.id)"
           >
             <motion.span
               v-if="navigation.category === category.id"

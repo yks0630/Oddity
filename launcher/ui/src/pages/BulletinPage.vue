@@ -83,6 +83,7 @@ const isActive = computed(() => state.page === "bulletin");
       v-model="filter"
       :options="filters"
       label="公告分类"
+      scrubbable
     />
     <div class="bulletin-content" :aria-busy="loading">
       <div v-if="errors.length" class="bulletin-errors">

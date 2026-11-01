@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { motion } from "motion-v";
 import { state, showPage } from "../../core/controller";
 import { navigationScrubbing } from "../../composables/navigationGesture";
+import { useScrubNavigation } from "../../composables/useScrubNavigation";
 
 const items = [
   { page: "home", label: "启动", icon: "play" },
@@ -20,118 +21,27 @@ const activeIndex = computed(() =>
 const hoveredPage = ref<string | null>(null);
 const pressedPage = ref<string | null>(null);
 const nav = ref<HTMLElement | null>(null);
-let gesture: { id: number; x: number; y: number; page: string } | undefined;
-let suppressClick = false;
-let finishing = 0;
+const { down, lost, cancel, suppressed } = useScrubNavigation({
+  root: nav,
+  item: "[data-page]",
+  value: (element) => element.dataset.page,
+  active: () => state.page,
+  select: (page) => showPage(page),
+  axis: "x",
+  corridor: 24,
+  focusOnFinish: true,
+  scrubbing: navigationScrubbing,
+});
 function buttons() {
   return [
     ...(nav.value?.querySelectorAll<HTMLButtonElement>("[data-page]") ?? []),
   ];
 }
-function inCorridor(y: number) {
-  const box = nav.value!.getBoundingClientRect();
-  return y >= box.top - 24 && y <= box.bottom + 24;
-}
-function select(x: number) {
-  const targets = buttons().map((button) => {
-    const box = button.getBoundingClientRect();
-    return { button, center: box.left + box.width / 2 };
-  });
-  const nearest = targets.reduce((best, entry) =>
-    Math.abs(entry.center - x) < Math.abs(best.center - x) ? entry : best,
-  ).button;
-  const active = targets.find(
-    (entry) => entry.button.dataset.page === state.page,
-  );
-  if (active && active.button !== nearest) {
-    const midpoint =
-      (active.center +
-        targets.find((entry) => entry.button === nearest)!.center) /
-      2;
-    if (Math.abs(x - midpoint) < 3) return;
-  }
-  if (nearest.dataset.page !== state.page) showPage(nearest.dataset.page!);
-}
-function down(event: PointerEvent) {
-  if (
-    !event.isPrimary ||
-    event.button !== 0 ||
-    gesture ||
-    !(event.target instanceof Element) ||
-    !event.target.closest("[data-page]")
-  )
-    return;
-  finishing++;
-  suppressClick = false;
-  gesture = {
-    id: event.pointerId,
-    x: event.clientX,
-    y: event.clientY,
-    page: state.page,
-  };
-}
-function move(event: PointerEvent) {
-  if (!gesture || event.pointerId !== gesture.id) return;
-  const dx = event.clientX - gesture.x;
-  const dy = event.clientY - gesture.y;
-  if (!navigationScrubbing.value) {
-    if (Math.abs(dy) > 8 && Math.abs(dy) > Math.abs(dx)) {
-      void finish(true);
-      return;
-    }
-    if (Math.abs(dx) < 6) return;
-    navigationScrubbing.value = true;
-    suppressClick = true;
-    nav.value?.setPointerCapture(event.pointerId);
-  }
-  if (inCorridor(event.clientY)) select(event.clientX);
-}
-async function finish(cancelled: boolean) {
-  if (!gesture) return;
-  const token = ++finishing;
-  const previous = gesture;
-  const wasScrubbing = navigationScrubbing.value;
-  gesture = undefined;
-  if (cancelled) {
-    suppressClick = true;
-    if (wasScrubbing) showPage(previous.page);
-  }
-  if (nav.value?.hasPointerCapture(previous.id))
-    nav.value.releasePointerCapture(previous.id);
-  await nextTick();
-  if (token !== finishing) return;
-  navigationScrubbing.value = false;
-  if (wasScrubbing)
-    buttons()
-      .find((button) => button.dataset.page === state.page)
-      ?.focus({ preventScroll: true });
-}
-function up(event: PointerEvent) {
-  if (!gesture || event.pointerId !== gesture.id) return;
-  if (navigationScrubbing.value && inCorridor(event.clientY))
-    select(event.clientX);
-  void finish(!inCorridor(event.clientY));
-}
-function cancel(event?: PointerEvent) {
-  if (gesture && (!event || event.pointerId === gesture.id)) void finish(true);
-}
-function lost(event: PointerEvent) {
-  if (event.target === nav.value) cancel(event);
-}
 function click(event: MouseEvent, page: string) {
-  if (suppressClick && event.detail !== 0) {
-    event.preventDefault();
-    return;
-  }
+  if (suppressed(event)) return;
   showPage(page);
 }
 function key(event: KeyboardEvent) {
-  if (event.key === "Escape" && gesture) {
-    event.preventDefault();
-    event.stopPropagation();
-    cancel();
-    return;
-  }
   if (!(event.target instanceof Element) || !nav.value?.contains(event.target))
     return;
   const current = buttons().findIndex(
@@ -149,7 +59,7 @@ function key(event: KeyboardEvent) {
             : -1;
   if (index < 0) return;
   event.preventDefault();
-  if (gesture) cancel();
+  cancel();
   navigationScrubbing.value = true;
   showPage(items[index].page);
   void nextTick(() => {
@@ -160,22 +70,12 @@ function key(event: KeyboardEvent) {
 function blur() {
   hoveredPage.value = null;
   pressedPage.value = null;
-  cancel();
 }
 onMounted(() => {
-  window.addEventListener("pointermove", move);
-  window.addEventListener("pointerup", up);
-  window.addEventListener("pointercancel", cancel);
   window.addEventListener("blur", blur);
   window.addEventListener("keydown", key, true);
 });
 onBeforeUnmount(() => {
-  finishing++;
-  gesture = undefined;
-  navigationScrubbing.value = false;
-  window.removeEventListener("pointermove", move);
-  window.removeEventListener("pointerup", up);
-  window.removeEventListener("pointercancel", cancel);
   window.removeEventListener("blur", blur);
   window.removeEventListener("keydown", key, true);
 });

@@ -210,6 +210,10 @@ fieldset:disabled .control-switch {
   border: 0;
   background: transparent;
 }
+.control-tabs--scrubbable {
+  touch-action: none;
+  user-select: none;
+}
 .category-tab {
   position: relative;
   display: flex;

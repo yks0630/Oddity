@@ -6,6 +6,7 @@ import { notify } from "../core/notifications";
 import { invoke, isDesktop } from "../core/api";
 import type { GameModeOptions, GameModeStatus } from "../types/launcher";
 import { useControlMotion } from "../composables/useControlMotion";
+import { useScrubNavigation } from "../composables/useScrubNavigation";
 import GamescopeSettings from "../components/GamescopeSettings.vue";
 import CpuSettings from "../components/CpuSettings.vue";
 import GpuSettings from "../components/GpuSettings.vue";
@@ -149,6 +150,28 @@ const results = computed(() => {
 function chooseCategory(value: Category) {
   category.value = value;
   query.value = "";
+}
+const categoriesNav = ref<HTMLElement | null>(null);
+const categoryScrubbing = ref(false);
+const {
+  down: categoryDown,
+  lost: categoryLost,
+  suppressed: categorySuppressed,
+} = useScrubNavigation({
+  root: categoriesNav,
+  item: "[data-category]",
+  value: (element) => element.dataset.category,
+  active: () => category.value,
+  select: (value) => chooseCategory(value as Category),
+  axis: "auto",
+  enabled: () => !searching.value,
+  focusOnFinish: true,
+  scrollIntoView: true,
+  scrubbing: categoryScrubbing,
+});
+function clickCategory(event: MouseEvent, value: Category) {
+  if (categorySuppressed(event)) return;
+  chooseCategory(value);
 }
 function categoryKeys(event: KeyboardEvent) {
   const index = categories.findIndex((item) => item.id === category.value);
@@ -391,9 +414,14 @@ const isActive = computed(() => state.page === "game-mode");
       </div>
       <div class="settings-frame">
         <nav
+          ref="categoriesNav"
           class="settings-categories"
+          :class="{ 'is-scrubbable': !searching }"
           aria-label="游戏模式分类"
+          :data-scrubbing="categoryScrubbing"
           @keydown="categoryKeys"
+          @pointerdown="categoryDown"
+          @lostpointercapture="categoryLost"
         >
           <motion.button
             v-for="item in categories"
@@ -408,7 +436,7 @@ const isActive = computed(() => state.page === "game-mode");
             :while-press="reduced ? undefined : { scale: 0.97 }"
             :transition="control"
             :aria-controls="`game-mode-panel-${item.id}`"
-            @click="chooseCategory(item.id)"
+            @click="clickCategory($event, item.id)"
           >
             <motion.span
               v-if="category === item.id"
