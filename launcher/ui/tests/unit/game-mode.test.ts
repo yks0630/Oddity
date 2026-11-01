@@ -179,6 +179,35 @@ it("检测失败时重试恢复控件", async () => {
   ).toBe(false);
 });
 
+it("自动检测不显示按钮忙碌态, 手动重新检测才显示", async () => {
+  let finishAuto!: (status: GameModeStatus) => void;
+  invoke.mockImplementationOnce(
+    () =>
+      new Promise<GameModeStatus>((resolve) => {
+        finishAuto = resolve;
+      }),
+  );
+  wrapper = mount(GameModePage);
+  const button = wrapper.get(".page-head button");
+  expect(button.attributes("aria-busy")).toBeUndefined();
+  finishAuto(structuredClone(result));
+  await flushPromises();
+  expect(button.attributes("aria-busy")).toBeUndefined();
+
+  let finishManual!: (status: GameModeStatus) => void;
+  invoke.mockImplementationOnce(
+    () =>
+      new Promise<GameModeStatus>((resolve) => {
+        finishManual = resolve;
+      }),
+  );
+  await button.trigger("click");
+  expect(button.attributes("aria-busy")).toBe("true");
+  finishManual(structuredClone(result));
+  await flushPromises();
+  expect(button.attributes("aria-busy")).toBeUndefined();
+});
+
 it("对应功能请求失败时提示重试, 离开页面后停止轮询", async () => {
   state.game = "running";
   result.session = result.capabilities.map((item) => ({

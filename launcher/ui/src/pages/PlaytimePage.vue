@@ -120,7 +120,6 @@ const isActive = computed(() => state.page === "records");
           icon="i-download-simple"
           data-pad-primary
           data-pad-action="导出"
-          :busy="playtime.loading"
           :disabled="!hasRecords"
           @click="openPoster"
           >生成海报</BaseButton

@@ -93,6 +93,7 @@ it("加载期间显示忙碌状态且不显示空记录提示", async () => {
   );
   await render();
   expect(wrapper.attributes("aria-busy")).toBe("true");
+  expect(posterButton().attributes("aria-busy")).toBeUndefined();
   expect(wrapper.find(".playtime-empty").exists()).toBe(false);
   resolve(history);
   await flushPromises();

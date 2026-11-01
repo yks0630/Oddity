@@ -21,7 +21,8 @@ const root = ref<HTMLElement | null>(null);
 const status = ref<GameModeStatus | null>(null);
 const gpu = ref<InstanceType<typeof GpuSettings> | null>(null);
 const tuning = ref<InstanceType<typeof CpuSettings> | null>(null);
-const loading = ref(false);
+// 自动检测只维护页面数据, 不点亮按钮; 否则进入页面时图标会误播切换动画.
+const detecting = ref(false);
 let timer: ReturnType<typeof setTimeout> | undefined;
 let disposed = false;
 const groups = [
@@ -242,10 +243,17 @@ function description(item: {
     overlay: "需安装 MangoHud.",
   }[item.id];
 }
-async function refresh() {
-  if (loading.value || disposed) return;
+let pending: Promise<void> | null = null;
+
+function refresh(manual = false) {
+  if (disposed) return;
+  if (manual) detecting.value = true;
+  // 自动检测进行中时, 手动点击复用同一轮结果, 等它结束再复位忙碌态.
+  if (!pending) pending = runRefresh();
+}
+
+async function runRefresh() {
   if (timer) clearTimeout(timer);
-  loading.value = true;
   await invoke("game_mode_status").then(
     (result) => {
       if (disposed) return;
@@ -274,7 +282,8 @@ async function refresh() {
         );
     },
   );
-  loading.value = false;
+  detecting.value = false;
+  pending = null;
   if (!disposed && state.page === "game-mode" && state.game !== "idle")
     timer = setTimeout(refresh, 2500);
 }
@@ -327,11 +336,11 @@ const isActive = computed(() => state.page === "game-mode");
           <BaseButton
             variant="ghost"
             icon="i-arrows-clockwise"
-            :busy="loading"
+            :busy="detecting"
             data-pad-primary
             data-pad-action="重新检测"
             @click="
-              refresh();
+              refresh(true);
               gpu?.reload();
               tuning?.reload();
             "
