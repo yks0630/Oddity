@@ -1,14 +1,17 @@
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use md5::Digest as _;
 
-use crate::game::check::{join_install_path, PatchRef, UpdateItem, UpdateKind, UpdatePlan};
+use crate::game::check::{
+    join_install_path, PatchRef, UpdateItem, UpdateKind, UpdatePlan, PATCH_DISK_RESERVE,
+};
 use crate::game::config::GameUpdateConfig;
 use crate::game::manifest::{Block, PakEntry, ResEntry};
 use crate::game::plan::StageTimings;
@@ -188,9 +191,123 @@ impl Drop for DownloadGuard<'_> {
     }
 }
 
+/// 等待应用许可时检查取消信号的间隔.
+const APPLY_WAIT_SLICE: Duration = Duration::from_millis(50);
+
+/// 补丁链的并发与暂存预算. 许可保留到产物安装或清理完成.
+struct ApplyGate {
+    state: Mutex<ApplyGateState>,
+    released: Condvar,
+    workspace_budget: u64,
+}
+
+#[derive(Default)]
+struct ApplyGateState {
+    limit: usize,
+    active: usize,
+    reserved: u64,
+}
+
+impl ApplyGate {
+    fn new(limit: usize, workspace_budget: u64) -> Self {
+        Self {
+            state: Mutex::new(ApplyGateState {
+                limit: limit.max(1),
+                active: 0,
+                reserved: 0,
+            }),
+            released: Condvar::new(),
+            workspace_budget,
+        }
+    }
+
+    /// 在同一把锁下预留空间, 避免多条链重复使用同一份余量.
+    /// 取消回调在锁外执行, 空间查询与准入共用门锁.
+    fn acquire_cancellable(
+        &self,
+        workspace: u64,
+        available: &dyn Fn() -> Result<u64>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ApplyPermit<'_>> {
+        loop {
+            if cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let mut state = self.lock();
+            let available = available()?;
+            let fits = state
+                .reserved
+                .checked_add(workspace)
+                .filter(|bytes| *bytes <= self.workspace_budget)
+                .and_then(|bytes| bytes.checked_add(PATCH_DISK_RESERVE))
+                .is_some_and(|needed| available >= needed);
+            if state.active < state.limit && fits {
+                state.active += 1;
+                state.reserved += workspace;
+                return Ok(ApplyPermit {
+                    gate: self,
+                    workspace,
+                });
+            }
+            if state.active == 0 {
+                return Err(Error::Integrity("暂存空间不足, 无法应用补丁链".into()));
+            }
+            let (state, _) = self
+                .released
+                .wait_timeout(state, APPLY_WAIT_SLICE)
+                .unwrap_or_else(|error| error.into_inner());
+            drop(state);
+        }
+    }
+
+    #[cfg(test)]
+    fn acquire(&self) -> ApplyPermit<'_> {
+        self.acquire_cancellable(0, &|| Ok(u64::MAX), &|| false)
+            .expect("acquire test permit")
+    }
+
+    /// 当前并发数; 仅测试用来确认阶段边界.
+    #[cfg(test)]
+    fn active(&self) -> usize {
+        self.lock().active
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ApplyGateState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+struct ApplyPermit<'a> {
+    gate: &'a ApplyGate,
+    workspace: u64,
+}
+
+impl Drop for ApplyPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.lock();
+        state.active -= 1;
+        state.reserved -= self.workspace;
+        self.gate.released.notify_all();
+    }
+}
+
+/// 应用并发上限: 留一半核心给下载和校验, 最多 4 路.
+fn apply_limit_for(parallelism: usize) -> usize {
+    (parallelism / 2).clamp(1, 4)
+}
+
+fn default_apply_limit() -> usize {
+    let parallelism = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    apply_limit_for(parallelism)
+}
+
 struct Progress<'a> {
     tx: &'a Sender<WorkerEvent>,
     index: usize,
+    /// 同一路径在整份计划里的序号, 不受 --only 选择影响.
+    tag_index: usize,
     cancelled: &'a (dyn Fn() -> bool + Send + Sync),
     limiter: &'a RateLimiter,
     download_clock: &'a DownloadClock,
@@ -209,6 +326,7 @@ impl Progress<'_> {
     fn new<'a>(
         tx: &'a Sender<WorkerEvent>,
         index: usize,
+        tag_index: usize,
         cancelled: &'a (dyn Fn() -> bool + Send + Sync),
         limiter: &'a RateLimiter,
         download_clock: &'a DownloadClock,
@@ -216,6 +334,7 @@ impl Progress<'_> {
         Progress {
             tx,
             index,
+            tag_index,
             cancelled,
             limiter,
             download_clock,
@@ -310,6 +429,7 @@ fn record_stage(bytes: &AtomicU64, nanos: &AtomicU64, amount: u64, elapsed: Dura
 
 enum Prepared {
     AlreadyCorrect,
+    Full,
     File(PathBuf),
     Patches(Vec<PathBuf>),
 }
@@ -462,6 +582,7 @@ pub fn apply_plan_observed_full(
         return finish_timings(report, &download_clock);
     }
 
+    let tag_indices = selected_tag_indices(plan, &selected);
     cleanup_stale_parts(&staging, plan);
     let max_threads = if plan.max_threads == 0 {
         config.max_threads
@@ -493,13 +614,35 @@ pub fn apply_plan_observed_full(
     let worker_config = &worker_config;
     let next = AtomicUsize::new(0);
     let install_lock = Mutex::new(());
+    // 下载量和安装后的正向净增长单独留足, 剩余空间才可分配给并发链产物.
+    let patch_growth = selected.iter().fold(0u64, |total, item| {
+        total.saturating_add(item.patch_disk_growth())
+    });
+    let workspace_budget = if selected.iter().any(|item| item.has_patch()) {
+        match crate::disk::available_bytes(&staging) {
+            Ok(available) => available
+                .saturating_sub(download_bytes)
+                .saturating_sub(patch_growth)
+                .saturating_sub(PATCH_DISK_RESERVE),
+            Err(error) => {
+                report.failed = 1;
+                report.ledger_error = Some(error.to_string());
+                return finish_timings(report, &download_clock);
+            }
+        }
+    } else {
+        0
+    };
+    let apply_gate = ApplyGate::new(default_apply_limit(), workspace_budget);
     let limiter = RateLimiter::new(limit_bytes_per_second);
     let (tx, rx) = mpsc::channel();
     let mut worker_txs: Vec<Sender<WorkerEvent>> = (0..workers).map(|_| tx.clone()).collect();
     drop(tx);
     let selected = &selected;
+    let tag_indices = &tag_indices;
     let staging = &staging;
     let install_lock = &install_lock;
+    let apply_gate = &apply_gate;
     let next = &next;
     let http = &http;
     let limiter = &limiter;
@@ -513,9 +656,11 @@ pub fn apply_plan_observed_full(
                     plan,
                     opts,
                     selected,
+                    tag_indices,
                     staging,
                     http,
                     install_lock,
+                    apply_gate,
                     next,
                     &tx,
                     limiter,
@@ -591,9 +736,11 @@ fn worker_loop(
     plan: &UpdatePlan,
     opts: &ApplyOptions,
     selected: &[&UpdateItem],
+    tag_indices: &[usize],
     staging: &Path,
     http: &HttpClient,
     install_lock: &Mutex<()>,
+    apply_gate: &ApplyGate,
     next: &AtomicUsize,
     tx: &Sender<WorkerEvent>,
     limiter: &RateLimiter,
@@ -609,7 +756,14 @@ fn worker_loop(
         if index >= selected.len() {
             return;
         }
-        let progress = Progress::new(tx, index, cancelled, limiter, download_clock);
+        let progress = Progress::new(
+            tx,
+            index,
+            tag_indices[index],
+            cancelled,
+            limiter,
+            download_clock,
+        );
         let _ = tx.send(WorkerEvent::Started { index });
         let (result, was_cancelled, timings) = process_item(
             config,
@@ -619,6 +773,7 @@ fn worker_loop(
             staging,
             http,
             install_lock,
+            apply_gate,
             &progress,
             allow_ranges,
         );
@@ -642,6 +797,7 @@ fn process_item(
     staging: &Path,
     http: &HttpClient,
     install_lock: &Mutex<()>,
+    apply_gate: &ApplyGate,
     progress: &Progress<'_>,
     allow_ranges: bool,
 ) -> (ApplyResult, bool, StageTimings) {
@@ -654,6 +810,7 @@ fn process_item(
         staging,
         http,
         install_lock,
+        apply_gate,
         progress,
         allow_ranges,
     );
@@ -684,6 +841,7 @@ fn run_item(
     staging: &Path,
     http: &HttpClient,
     install_lock: &Mutex<()>,
+    apply_gate: &ApplyGate,
     progress: &Progress<'_>,
     allow_ranges: bool,
 ) -> Result<()> {
@@ -706,29 +864,24 @@ fn run_item(
         progress,
         allow_ranges,
     )?;
-    match prepared {
-        Prepared::AlreadyCorrect => Ok(()),
-        Prepared::File(temp) => {
-            progress.stage(ApplyStage::Install);
-            let installed = with_install_lock(install_lock, || {
-                if progress.cancelled() {
-                    return Err(Error::Cancelled);
-                }
-                check_paths()?;
-                install_observed(progress, &temp, target, item.size)
-            });
-            if installed.is_ok() {
-                remove_patch_temps(staging, item);
-            }
-            installed
-        }
+    let mut permit = None;
+    let temp = match prepared {
+        Prepared::AlreadyCorrect => return Ok(()),
+        Prepared::File(temp) => Some(temp),
+        Prepared::Full => None,
         Prepared::Patches(patches) => {
-            let applied = with_install_lock(install_lock, || {
+            let applied = (|| -> Result<PathBuf> {
+                // 校验和等待安装时产物仍在暂存盘, 不能提前归还预算.
+                permit = Some(apply_gate.acquire_cancellable(
+                    item.patch_workspace(),
+                    &|| crate::disk::available_bytes(staging),
+                    &|| progress.cancelled(),
+                )?);
                 if progress.cancelled() {
                     return Err(Error::Cancelled);
                 }
-                check_paths()?;
                 progress.stage(ApplyStage::Patch);
+                check_paths()?;
                 let final_path = apply_patch_chain(item, target, staging, &patches, progress)?;
                 progress.stage(ApplyStage::Verify);
                 if !verify_observed(progress, &final_path, item.size, &item.md5)? {
@@ -737,38 +890,48 @@ fn run_item(
                         target.display()
                     )));
                 }
-                progress.stage(ApplyStage::Install);
-                install_observed(progress, &final_path, target, item.size)
-            });
+                Ok(final_path)
+            })();
             match applied {
-                Ok(()) => {
-                    for patch in &patches {
-                        fs::remove_file(patch).ok();
-                    }
-                    Ok(())
-                }
-                Err(Error::Cancelled) => Err(Error::Cancelled),
+                Ok(temp) => Some(temp),
+                // 保留已生成的最终产物供下次续传.
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
                 Err(_) => {
-                    // 补丁链失败时回退完整文件；已下载的补丁字节仍计入报告。
-                    remove_chain_temps(staging, item);
-                    let temp = download_full(config, item, staging, http, progress, allow_ranges)?;
-                    progress.stage(ApplyStage::Install);
-                    let installed = with_install_lock(install_lock, || {
-                        if progress.cancelled() {
-                            return Err(Error::Cancelled);
-                        }
-                        check_paths()?;
-                        install_observed(progress, &temp, target, item.size)
-                    });
-                    if installed.is_ok() {
-                        remove_patch_temps(staging, item);
-                        remove_chain_temps(staging, item);
-                    }
-                    installed
+                    remove_chain_temps(staging, item, progress.tag_index);
+                    permit.take();
+                    None
                 }
             }
         }
+    };
+    let temp = match temp {
+        Some(temp) => temp,
+        None => {
+            // 回退整包同样需要暂存预算, 不能在补丁失败后绕过空间限制.
+            if item.has_patch() {
+                permit = Some(apply_gate.acquire_cancellable(
+                    item.size,
+                    &|| crate::disk::available_bytes(staging),
+                    &|| progress.cancelled(),
+                )?);
+            }
+            download_full(config, item, staging, http, progress, allow_ranges)?
+        }
+    };
+    progress.stage(ApplyStage::Install);
+    let installed = with_install_lock(install_lock, || {
+        if progress.cancelled() {
+            return Err(Error::Cancelled);
+        }
+        check_paths()?;
+        install_observed(progress, &temp, target, item.size)
+    });
+    if installed.is_ok() {
+        remove_patch_temps(staging, item, progress.tag_index);
+        remove_chain_temps(staging, item, progress.tag_index);
     }
+    drop(permit);
+    installed
 }
 
 fn with_install_lock<T>(lock: &Mutex<()>, action: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -796,7 +959,7 @@ fn prepare_item(
     }
 
     if !item.patches.is_empty() && target.is_file() {
-        if let Some(final_temp) = chain_final_temp(staging, item) {
+        if let Some(final_temp) = chain_final_temp(staging, item, progress.tag_index) {
             if final_temp.is_file() && verify_observed(progress, &final_temp, item.size, &item.md5)?
             {
                 // 完整补丁产物是之前下载并应用补丁的结果, 计入本轮已下载量.
@@ -804,7 +967,7 @@ fn prepare_item(
                 return Ok(Prepared::File(final_temp));
             }
         }
-        remove_chain_temps(staging, item);
+        remove_chain_temps(staging, item, progress.tag_index);
         let mut paths = Vec::with_capacity(item.patches.len());
         let mut failed = None;
         for patch in &item.patches {
@@ -823,8 +986,7 @@ fn prepare_item(
         // 补丁下载失败时还可以退回整文件；继续走完整下载。
     }
 
-    let bytes = download_full(config, item, staging, http, progress, allow_ranges)?;
-    Ok(Prepared::File(bytes))
+    Ok(Prepared::Full)
 }
 
 fn quick_target_matches(item: &UpdateItem, target: &Path) -> bool {
@@ -846,15 +1008,18 @@ fn download_full(
     allow_ranges: bool,
 ) -> Result<PathBuf> {
     progress.stage(ApplyStage::Download);
+    let tag = item_tag(item, progress.tag_index);
     let temp = match &item.kind {
         UpdateKind::Res { res } => {
-            download_res(config, res, staging, http, progress, allow_ranges)?
+            download_res(config, res, &tag, staging, http, progress, allow_ranges)?
         }
         UpdateKind::PakEntry {
             pak_md5,
             pak_size,
             entry,
-        } => download_pak_entry(config, pak_md5, *pak_size, entry, staging, http, progress)?,
+        } => download_pak_entry(
+            config, pak_md5, *pak_size, entry, &tag, staging, http, progress,
+        )?,
     };
     Ok(temp)
 }
@@ -870,12 +1035,7 @@ fn download_patch(
 ) -> Result<PathBuf> {
     progress.stage(ApplyStage::Download);
     let url = res_url(config, &patch.md5, patch.size)?;
-    let temp = staging.join("Patch").join(format!(
-        "{}.{}.{}.part",
-        patch.md5,
-        patch.size,
-        path_tag(&item.path)
-    ));
+    let temp = patch_temp_path(staging, item, patch, progress.tag_index);
     download_to_temp(
         config,
         http,
@@ -894,6 +1054,7 @@ fn download_patch(
 fn download_res(
     config: &GameUpdateConfig,
     res: &ResEntry,
+    tag: &str,
     staging: &Path,
     http: &HttpClient,
     progress: &Progress<'_>,
@@ -904,7 +1065,7 @@ fn download_res(
         "{}.{}.{}.part",
         res.md5.to_ascii_lowercase(),
         res.filesize,
-        path_tag(&res.filename)
+        tag
     ));
     download_to_temp(
         config,
@@ -921,11 +1082,13 @@ fn download_res(
     Ok(temp)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn download_pak_entry(
     config: &GameUpdateConfig,
     pak_md5: &str,
     pak_size: u64,
     entry: &PakEntry,
+    tag: &str,
     staging: &Path,
     http: &HttpClient,
     progress: &Progress<'_>,
@@ -937,12 +1100,9 @@ fn download_pak_entry(
         )));
     }
     let url = res_url(config, pak_md5, pak_size)?;
-    let temp = staging.join("Pak").join(format!(
-        "{}.{}.{}.part",
-        entry.md5,
-        entry.size,
-        path_tag(&entry.name)
-    ));
+    let temp = staging
+        .join("Pak")
+        .join(format!("{}.{}.{}.part", entry.md5, entry.size, tag));
     download_range_to_temp(
         config,
         http,
@@ -984,7 +1144,7 @@ fn apply_patch_chain(
                 step, patch.old_size, current_size
             )));
         }
-        let out = chain_temp(staging, item, step);
+        let out = chain_temp(staging, item, step, progress.tag_index);
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1003,42 +1163,42 @@ fn apply_patch_chain(
     Ok(current)
 }
 
-fn chain_temp(staging: &Path, item: &UpdateItem, step: usize) -> PathBuf {
+fn chain_temp(staging: &Path, item: &UpdateItem, step: usize, index: usize) -> PathBuf {
     let patch = &item.patches[step];
     staging.join("Patch").join(format!(
         "{}.{}.{}.{}.tmp",
-        path_tag(&item.path),
+        item_tag(item, index),
         step,
         patch.new_md5,
         patch.new_size
     ))
 }
 
-fn chain_final_temp(staging: &Path, item: &UpdateItem) -> Option<PathBuf> {
+fn chain_final_temp(staging: &Path, item: &UpdateItem, index: usize) -> Option<PathBuf> {
     item.patches
         .len()
         .checked_sub(1)
-        .map(|step| chain_temp(staging, item, step))
+        .map(|step| chain_temp(staging, item, step, index))
 }
 
-fn remove_chain_temps(staging: &Path, item: &UpdateItem) {
+fn remove_chain_temps(staging: &Path, item: &UpdateItem, index: usize) {
     for step in 0..item.patches.len() {
-        fs::remove_file(chain_temp(staging, item, step)).ok();
+        fs::remove_file(chain_temp(staging, item, step, index)).ok();
     }
 }
 
-fn patch_temp_path(staging: &Path, item: &UpdateItem, patch: &PatchRef) -> PathBuf {
+fn patch_temp_path(staging: &Path, item: &UpdateItem, patch: &PatchRef, index: usize) -> PathBuf {
     staging.join("Patch").join(format!(
         "{}.{}.{}.part",
         patch.md5,
         patch.size,
-        path_tag(&item.path)
+        item_tag(item, index)
     ))
 }
 
-fn remove_patch_temps(staging: &Path, item: &UpdateItem) {
+fn remove_patch_temps(staging: &Path, item: &UpdateItem, index: usize) {
     for patch in &item.patches {
-        fs::remove_file(patch_temp_path(staging, item, patch)).ok();
+        fs::remove_file(patch_temp_path(staging, item, patch, index)).ok();
     }
 }
 
@@ -1891,15 +2051,61 @@ fn path_tag(path: &str) -> String {
     format!("{hash:016x}")
 }
 
-fn cleanup_stale_parts(staging: &Path, plan: &UpdatePlan) {
-    let mut keep = Vec::new();
+/// 每个 item 的唯一暂存标识.
+///
+/// 清单允许重复路径, 这里用「同一路径在整份计划里的序号」区分; 该序号与
+/// --only 选择无关, 因此中断后换一种选择仍能续传。同一路径的 item 增删时
+/// 序号会变化, 旧暂存会被清理。
+fn item_tag(item: &UpdateItem, index: usize) -> String {
+    item_tag_for(&item.path, index)
+}
+
+/// 计算 selected 中每个 item 的暂存序号(同一路径在 plan.items 中的出现次序).
+fn selected_tag_indices(plan: &UpdatePlan, selected: &[&UpdateItem]) -> Vec<usize> {
+    let mut counts = HashMap::new();
+    let mut chosen = selected.iter().peekable();
+    let mut indices = Vec::with_capacity(selected.len());
     for item in &plan.items {
-        keep.push(format!("{}.{}", item.md5.to_ascii_lowercase(), item.size));
-        if let UpdateKind::PakEntry { entry, .. } = &item.kind {
-            keep.push(format!("{}.{}", entry.md5.to_ascii_lowercase(), entry.size));
+        let ordinal = counts.entry(&item.path).or_insert(0);
+        if chosen.peek().is_some_and(|next| std::ptr::eq(item, **next)) {
+            indices.push(*ordinal);
+            chosen.next();
         }
-        for patch in &item.patches {
-            keep.push(format!("{}.{}", patch.md5, patch.size));
+        *ordinal += 1;
+    }
+    indices
+}
+
+fn item_tag_for(path: &str, index: usize) -> String {
+    format!("{}-{index}", path_tag(path))
+}
+
+/// 保留整份计划的精确暂存路径, 清除过期下载、索引和链产物.
+/// --only 不改变清理范围, 未选中项仍可在下一轮续传.
+fn cleanup_stale_parts(staging: &Path, plan: &UpdatePlan) {
+    let items: Vec<&UpdateItem> = plan.items.iter().collect();
+    let tag_indices = selected_tag_indices(plan, &items);
+    let mut keep = HashSet::new();
+    for (item, index) in items.into_iter().zip(tag_indices) {
+        let tag = item_tag(item, index);
+        let full = match &item.kind {
+            UpdateKind::Res { res } => staging.join("Res").join(format!(
+                "{}.{}.{}.part",
+                res.md5.to_ascii_lowercase(),
+                res.filesize,
+                tag
+            )),
+            UpdateKind::PakEntry { entry, .. } => staging
+                .join("Pak")
+                .join(format!("{}.{}.{}.part", entry.md5, entry.size, tag)),
+        };
+        keep.insert(range_index_path(&full));
+        keep.insert(full);
+        for (step, patch) in item.patches.iter().enumerate() {
+            let temp = patch_temp_path(staging, item, patch, index);
+            keep.insert(range_index_path(&temp));
+            keep.insert(temp);
+            keep.insert(chain_temp(staging, item, step, index));
         }
     }
     for directory in [
@@ -1912,13 +2118,11 @@ fn cleanup_stale_parts(staging: &Path, plan: &UpdatePlan) {
         };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".part") && !name.ends_with(".cb.idx") {
-                continue;
+            if (name.ends_with(".part") || name.ends_with(".cb.idx") || name.ends_with(".tmp"))
+                && !keep.contains(&entry.path())
+            {
+                fs::remove_file(entry.path()).ok();
             }
-            if keep.iter().any(|prefix| name.starts_with(prefix)) {
-                continue;
-            }
-            fs::remove_file(entry.path()).ok();
         }
     }
 }
@@ -2038,12 +2242,18 @@ mod tests {
         )
     }
 
-    fn res_temp(config: &GameUpdateConfig, path: &str, md5: &str, size: u64) -> PathBuf {
+    fn res_temp(
+        config: &GameUpdateConfig,
+        path: &str,
+        md5: &str,
+        size: u64,
+        index: usize,
+    ) -> PathBuf {
         config.patcher_dir.join("tmp/nte-native/Res").join(format!(
             "{}.{}.{}.part",
             md5,
             size,
-            path_tag(path)
+            item_tag_for(path, index)
         ))
     }
 
@@ -2286,7 +2496,7 @@ mod tests {
         let path = res_path(&md5, content.len() as u64);
         server.route(&path, content);
 
-        let part = res_temp(&config, "data/a.bin", &md5, content.len() as u64);
+        let part = res_temp(&config, "data/a.bin", &md5, content.len() as u64, 0);
         fs::create_dir_all(part.parent().expect("parent")).expect("create staging");
         fs::write(&part, content).expect("write part");
 
@@ -2317,7 +2527,7 @@ mod tests {
         let path = res_path(&md5, content.len() as u64);
         server.route(&path, &content);
 
-        let part = res_temp(&config, "data/a.bin", &md5, content.len() as u64);
+        let part = res_temp(&config, "data/a.bin", &md5, content.len() as u64, 0);
         fs::create_dir_all(part.parent().expect("parent")).expect("create staging");
         fs::write(&part, &content[..100]).expect("write partial");
 
@@ -2342,7 +2552,7 @@ mod tests {
         let path = res_path(&md5, content.len() as u64);
         server.route(&path, content);
 
-        let part = res_temp(&config, "data/a.bin", &md5, content.len() as u64);
+        let part = res_temp(&config, "data/a.bin", &md5, content.len() as u64, 0);
         fs::create_dir_all(part.parent().expect("parent")).expect("create staging");
         fs::write(&part, b"wrong content").expect("write broken part");
         let mut plan = plan_of(vec![res_item("data/a.bin", &md5, content.len() as u64)]);
@@ -2352,7 +2562,7 @@ mod tests {
         assert_eq!(report.downloaded_bytes, content.len() as u64);
         assert_eq!(dir.read("install/data/a.bin"), content);
 
-        let part = res_temp(&config, "data/b.bin", &md5, content.len() as u64);
+        let part = res_temp(&config, "data/b.bin", &md5, content.len() as u64, 0);
         fs::create_dir_all(part.parent().expect("parent")).expect("create staging");
         fs::write(&part, vec![0u8; content.len() + 5]).expect("write oversized part");
         let mut plan = plan_of(vec![res_item("data/b.bin", &md5, content.len() as u64)]);
@@ -2371,7 +2581,7 @@ mod tests {
         let md5 = "ab".repeat(16);
         server.route(res_path(&md5, 100), b"short");
 
-        let part = res_temp(&config, "data/a.bin", &md5, 100);
+        let part = res_temp(&config, "data/a.bin", &md5, 100, 0);
         fs::create_dir_all(part.parent().expect("parent")).expect("create staging");
         fs::write(&part, vec![0u8; 50]).expect("write partial");
 
@@ -2692,6 +2902,449 @@ mod tests {
     }
 
     #[test]
+    fn patch_apply_and_verify_run_outside_the_install_lock() {
+        let dir = TempDir::new("dl-patch-lock-scope");
+        let config = config_for(&dir);
+        let old_content = b"version one: reusable game bytes\n";
+        let new_content = b"version two: reusable game bytes!\n";
+        let old_md5 = crate::update::md5_bytes(old_content);
+        let new_md5 = crate::update::md5_bytes(new_content);
+        dir.write("install/data/a.bin", old_content);
+        let patch_bytes = include_bytes!("../../tests/fixtures/reusable-game.hdiff");
+        let patch_md5 = crate::update::md5_bytes(patch_bytes);
+        let item = patch_item(
+            "data/a.bin",
+            &old_md5,
+            old_content.len() as u64,
+            &new_md5,
+            new_content.len() as u64,
+            &[(&patch_md5, patch_bytes.len() as u64)],
+        );
+
+        // 补丁已下载完成, 让流程直接进入应用/校验/安装三个阶段.
+        let staging = config.patcher_dir.join("tmp/nte-native");
+        let patch_path = patch_temp_path(&staging, &item, &item.patches[0], 0);
+        fs::create_dir_all(patch_path.parent().expect("patch parent")).expect("create staging");
+        fs::write(&patch_path, patch_bytes).expect("write patch temp");
+
+        // 取消回调随执行流同步调用, 用采样结果确认各阶段持有的锁与许可.
+        let install_lock = std::sync::Arc::new(Mutex::new(()));
+        let apply_gate = std::sync::Arc::new(ApplyGate::new(2, u64::MAX - PATCH_DISK_RESERVE));
+        let samples = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let probe_lock = install_lock.clone();
+        let probe_gate = apply_gate.clone();
+        let probe_samples = samples.clone();
+        let final_path = chain_final_temp(&staging, &item, 0).unwrap();
+        let cancelled = move || {
+            let locked = probe_lock.try_lock().is_err();
+            let applying = probe_gate.active();
+            probe_samples.lock().expect("record lock state").push((
+                locked,
+                applying,
+                final_path.is_file(),
+            ));
+            false
+        };
+        let (tx, _rx) = mpsc::channel();
+        let limiter = RateLimiter::new(0);
+        let clock = DownloadClock::new();
+        let progress = Progress::new(&tx, 0, 0, &cancelled, &limiter, &clock);
+        let http = HttpClient::new();
+        run_item(
+            &config,
+            &ApplyOptions::default(),
+            &item,
+            &config.install_root.join("data/a.bin"),
+            &staging,
+            &http,
+            &install_lock,
+            &apply_gate,
+            &progress,
+            false,
+        )
+        .expect("apply patch chain");
+        assert_eq!(dir.read("install/data/a.bin"), new_content);
+
+        let samples = samples.lock().expect("lock samples").clone();
+        // 应用阶段持有 ApplyPermit, 但不再占用安装锁.
+        assert!(
+            samples
+                .iter()
+                .any(|(locked, applying, _)| !locked && *applying > 0),
+            "应用补丁时不应持有安装锁: {samples:?}"
+        );
+        // 最终产物已生成后的校验仍在安装锁外, 且继续持有暂存许可.
+        assert!(samples
+            .iter()
+            .any(|(locked, applying, created)| !locked && *applying > 0 && *created));
+        assert!(samples
+            .iter()
+            .any(|(locked, applying, _)| *locked && *applying > 0));
+        assert_eq!(apply_gate.active(), 0);
+    }
+
+    #[test]
+    fn duplicate_items_use_separate_staging_paths() {
+        let dir = TempDir::new("dl-duplicate-items");
+        let server = HttpServer::start();
+        let mut config = config_for(&dir);
+        config.cdns = vec![server.url("/cdn")];
+        config.max_threads = 4;
+        let old_content = b"version one: reusable game bytes\n";
+        let new_content = b"version two: reusable game bytes!\n";
+        let old_md5 = crate::update::md5_bytes(old_content);
+        let new_md5 = crate::update::md5_bytes(new_content);
+        dir.write("install/data/a.bin", old_content);
+        let patch_bytes = include_bytes!("../../tests/fixtures/reusable-game.hdiff");
+        let patch_md5 = crate::update::md5_bytes(patch_bytes);
+        server.route(res_path(&patch_md5, patch_bytes.len() as u64), patch_bytes);
+        // 补丁链失败时会回退整包, 所以整包也要能下载.
+        server.route(res_path(&new_md5, new_content.len() as u64), new_content);
+        let item = patch_item(
+            "data/a.bin",
+            &old_md5,
+            old_content.len() as u64,
+            &new_md5,
+            new_content.len() as u64,
+            &[(&patch_md5, patch_bytes.len() as u64)],
+        );
+        let plan = plan_of(vec![item.clone(), item]);
+
+        let report = apply_plan(&config, &plan, &ApplyOptions::default());
+        assert_eq!(report.failed, 0, "{:?}", report.results);
+        assert_eq!(report.results.len(), 2);
+        assert!(
+            report.results.iter().all(|result| result.ok),
+            "{:?}",
+            report.results
+        );
+        assert_eq!(dir.read("install/data/a.bin"), new_content);
+
+        // 两个重复项各有独立暂存路径, 收尾后不应残留临时文件.
+        let staging = config.patcher_dir.join("tmp/nte-native");
+        let leftovers: Vec<String> = fs::read_dir(staging.join("Patch"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "暂存文件应清理干净: {leftovers:?}");
+    }
+
+    #[test]
+    fn duplicate_items_get_distinct_staging_paths() {
+        let dir = TempDir::new("dl-duplicate-tags");
+        let config = config_for(&dir);
+        let staging = config.patcher_dir.join("tmp/nte-native");
+        let patch_bytes = include_bytes!("../../tests/fixtures/reusable-game.hdiff");
+        let patch_md5 = crate::update::md5_bytes(patch_bytes);
+        let item = patch_item(
+            "data/a.bin",
+            &crate::update::md5_bytes(b"old"),
+            3,
+            &crate::update::md5_bytes(b"new"),
+            3,
+            &[(&patch_md5, patch_bytes.len() as u64)],
+        );
+        // 同一路径的不同条目必须落到不同暂存路径.
+        assert_ne!(item_tag(&item, 0), item_tag(&item, 1));
+        assert_ne!(
+            patch_temp_path(&staging, &item, &item.patches[0], 0),
+            patch_temp_path(&staging, &item, &item.patches[0], 1)
+        );
+        assert_ne!(
+            chain_temp(&staging, &item, 0, 0),
+            chain_temp(&staging, &item, 0, 1)
+        );
+        assert_ne!(
+            chain_final_temp(&staging, &item, 0),
+            chain_final_temp(&staging, &item, 1)
+        );
+
+        // 两个重复项都在计划里时, 清理不能把任何一方的暂存当成过期删除.
+        fs::create_dir_all(staging.join("Patch")).expect("create patch staging");
+        let first = patch_temp_path(&staging, &item, &item.patches[0], 0);
+        let second = patch_temp_path(&staging, &item, &item.patches[0], 1);
+        fs::write(&first, b"x").expect("write first part");
+        fs::write(&second, b"x").expect("write second part");
+        let final_temp = chain_final_temp(&staging, &item, 0).unwrap();
+        let obsolete_temp = chain_temp(&staging, &item, 0, 10);
+        fs::write(&final_temp, b"output").expect("keep reusable output");
+        fs::write(&obsolete_temp, b"obsolete output").expect("stale chain output");
+        let plan = plan_of(vec![item.clone(), item]);
+        cleanup_stale_parts(&staging, &plan);
+        assert!(first.exists());
+        assert!(second.exists());
+        assert!(final_temp.exists(), "当前计划的链产物应保留供续传");
+        assert!(!obsolete_temp.exists(), "旧条目的链产物应回收");
+    }
+
+    #[test]
+    fn tag_indices_do_not_depend_on_only_selection() {
+        let _dir = TempDir::new("dl-tag-stability");
+        let old_md5 = crate::update::md5_bytes(b"old");
+        let new_md5 = crate::update::md5_bytes(b"new");
+        let patch_md5 = "cc".repeat(16);
+        let item = patch_item("data/a.bin", &old_md5, 3, &new_md5, 3, &[(&patch_md5, 10)]);
+        let other = res_item("data/b.bin", &"dd".repeat(16), 5);
+        let plan = plan_of(vec![item.clone(), other, item]);
+        let all: Vec<&UpdateItem> = plan.items.iter().collect();
+        let all_tags = selected_tag_indices(&plan, &all);
+        assert_eq!(all_tags, vec![0, 0, 1]);
+
+        // --only data/a.bin 选中两个同路径项, 序号仍应保持 0/1.
+        let only: Vec<&UpdateItem> = plan
+            .items
+            .iter()
+            .filter(|item| item.path.contains("data/a.bin"))
+            .collect();
+        let only_tags = selected_tag_indices(&plan, &only);
+        assert_eq!(only_tags, vec![0, 1]);
+        assert_eq!(
+            item_tag(all[0], all_tags[0]),
+            item_tag(only[0], only_tags[0])
+        );
+        assert_eq!(
+            item_tag(all[2], all_tags[2]),
+            item_tag(only[1], only_tags[1])
+        );
+        assert!(std::ptr::eq(all[0], only[0]));
+    }
+
+    #[test]
+    fn apply_gate_blocks_above_its_limit_and_wakes_on_drop() {
+        let gate = ApplyGate::new(2, u64::MAX - PATCH_DISK_RESERVE);
+        let first = gate.acquire();
+        let second = gate.acquire();
+        assert_eq!(gate.active(), 2);
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let gate = &gate;
+            let tx = tx.clone();
+            scope.spawn(move || {
+                let _permit = gate.acquire();
+                tx.send(()).expect("signal permit");
+            });
+            // 许可已满时, 第三路必须阻塞.
+            assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+            drop(second);
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("third acquire after release");
+        });
+        drop(first);
+        assert_eq!(gate.active(), 0);
+
+        // 释放后可以继续获取.
+        let again = gate.acquire();
+        assert_eq!(gate.active(), 1);
+        drop(again);
+        assert_eq!(gate.active(), 0);
+    }
+
+    #[test]
+    fn apply_gate_wait_observes_cancellation() {
+        let gate = ApplyGate::new(4, 500);
+        let permit = gate
+            .acquire_cancellable(500, &|| Ok(u64::MAX), &|| false)
+            .unwrap();
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+        let (tx, rx) = mpsc::channel();
+        let stopped_while_waiting = std::thread::scope(|scope| {
+            let gate = &gate;
+            let flag = cancelled.clone();
+            let handle = scope.spawn(move || {
+                let result = gate.acquire_cancellable(
+                    500,
+                    &|| {
+                        tx.send(()).unwrap();
+                        Ok(u64::MAX)
+                    },
+                    &|| flag.load(Ordering::Relaxed),
+                );
+                matches!(result, Err(Error::Cancelled))
+            });
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("workspace admission attempted");
+            cancelled.store(true, Ordering::Relaxed);
+            handle.join().expect("join gate waiter")
+        });
+        assert!(stopped_while_waiting, "等待许可时应响应取消");
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // 取消不影响许可的释放与后续获取.
+        drop(permit);
+        assert_eq!(gate.active(), 0);
+        let again = gate.acquire();
+        assert_eq!(gate.active(), 1);
+        drop(again);
+        // 持续取消时不会再等到许可.
+        assert!(matches!(
+            gate.acquire_cancellable(0, &|| Ok(u64::MAX), &|| true),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn apply_limit_uses_half_the_cores_up_to_four() {
+        assert_eq!(apply_limit_for(1), 1);
+        assert_eq!(apply_limit_for(3), 1);
+        assert_eq!(apply_limit_for(4), 2);
+        assert_eq!(apply_limit_for(8), 4);
+        assert_eq!(apply_limit_for(64), 4);
+    }
+
+    #[test]
+    fn apply_gate_reserves_workspace_until_the_permit_is_dropped() {
+        // 剩余空间只容得下一条链, 即使第一条尚未写盘也不能放行第二条.
+        let gate = ApplyGate::new(4, 500);
+        let available = || Ok(PATCH_DISK_RESERVE + 500);
+        let first = gate
+            .acquire_cancellable(500, &available, &|| false)
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let gate = &gate;
+            let available = &available;
+            scope.spawn(move || {
+                let _permit = gate
+                    .acquire_cancellable(
+                        500,
+                        &|| {
+                            attempt_tx.send(()).unwrap();
+                            available()
+                        },
+                        &|| false,
+                    )
+                    .unwrap();
+                tx.send(()).unwrap();
+            });
+            attempt_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second admission attempted");
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert_eq!(gate.lock().reserved, 500);
+            drop(first);
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("workspace released");
+        });
+        assert_eq!(gate.lock().reserved, 0);
+
+        // 无其它链可等待时直接返回错误, 不会永久阻塞.
+        assert!(gate
+            .acquire_cancellable(501, &available, &|| false)
+            .is_err());
+        assert!(gate
+            .acquire_cancellable(500, &|| Ok(PATCH_DISK_RESERVE + 499), &|| false)
+            .is_err());
+        assert!(gate
+            .acquire_cancellable(u64::MAX, &|| Ok(u64::MAX), &|| false)
+            .is_err());
+    }
+
+    #[test]
+    fn apply_gate_admits_multiple_chains_within_the_shared_budget() {
+        let gate = ApplyGate::new(4, 1000);
+        let first = gate
+            .acquire_cancellable(400, &|| Ok(u64::MAX), &|| false)
+            .unwrap();
+        let second = gate
+            .acquire_cancellable(600, &|| Ok(u64::MAX), &|| false)
+            .unwrap();
+        assert_eq!(gate.active(), 2);
+        assert_eq!(gate.lock().reserved, 1000);
+        assert!(matches!(
+            gate.acquire_cancellable(1, &|| Ok(u64::MAX), &|| true),
+            Err(Error::Cancelled)
+        ));
+        drop(first);
+        drop(second);
+        assert_eq!(gate.lock().reserved, 0);
+    }
+
+    #[test]
+    fn chain_workspace_uses_the_adjacent_output_peak() {
+        let mut item = patch_item(
+            "data/a.bin",
+            &"aa".repeat(16),
+            10,
+            &"bb".repeat(16),
+            30,
+            &[(&"cc".repeat(16), 4), (&"dd".repeat(16), 5)],
+        );
+        assert_eq!(item.patch_workspace(), 30 + 30);
+        // 多跳时按相邻两跳产物之和取峰值.
+        item.patches[0].new_size = 100;
+        item.patches[1].new_size = 300;
+        assert_eq!(item.patch_workspace(), 400);
+
+        let single = patch_item(
+            "data/b.bin",
+            &"ee".repeat(16),
+            10,
+            &"ff".repeat(16),
+            42,
+            &[(&"11".repeat(16), 3)],
+        );
+        assert_eq!(single.patch_workspace(), 42);
+        assert_eq!(
+            res_item("data/c.bin", &"22".repeat(16), 7).patch_workspace(),
+            0
+        );
+    }
+
+    #[test]
+    fn patch_fallback_does_not_download_past_the_workspace_budget() {
+        let dir = TempDir::new("dl-patch-space");
+        let server = HttpServer::start();
+        let mut config = config_for(&dir);
+        config.cdns = vec![server.url("/cdn")];
+        let old = b"old game bytes";
+        let new = b"new game bytes";
+        let patch = b"invalid patch bytes";
+        let patch_md5 = crate::update::md5_bytes(patch);
+        let item = patch_item(
+            "data/a.bin",
+            &crate::update::md5_bytes(old),
+            old.len() as u64,
+            &crate::update::md5_bytes(new),
+            new.len() as u64,
+            &[(&patch_md5, patch.len() as u64)],
+        );
+        dir.write("install/data/a.bin", old);
+        let staging = config.patcher_dir.join("tmp/nte-native");
+        let cached = patch_temp_path(&staging, &item, &item.patches[0], 0);
+        fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        fs::write(cached, patch).unwrap();
+        server.route(res_path(&item.md5, item.size), new);
+        let gate = ApplyGate::new(4, 0);
+        let (tx, _rx) = mpsc::channel();
+        let clock = DownloadClock::new();
+        let limiter = RateLimiter::new(0);
+        let progress = Progress::new(&tx, 0, 0, &|| false, &limiter, &clock);
+        let result = run_item(
+            &config,
+            &ApplyOptions::default(),
+            &item,
+            &config.install_root.join("data/a.bin"),
+            &staging,
+            &HttpClient::new(),
+            &Mutex::new(()),
+            &gate,
+            &progress,
+            false,
+        );
+        assert!(matches!(result, Err(Error::Integrity(_))));
+        assert!(server.targets().is_empty(), "空间不足时不应继续下载整包");
+        assert_eq!(dir.read("install/data/a.bin"), old);
+        assert_eq!(gate.active(), 0);
+    }
+
+    #[test]
     fn patch_failures_fall_back_to_the_full_file() {
         let dir = TempDir::new("dl-patch-fallback");
         let server = HttpServer::start();
@@ -2820,7 +3473,7 @@ mod tests {
         let md5 = crate::update::md5_bytes(&content);
         server.route(res_path(&md5, content.len() as u64), &content);
 
-        let part = res_temp(&config, "data/a.bin", &md5, content.len() as u64);
+        let part = res_temp(&config, "data/a.bin", &md5, content.len() as u64, 0);
         fs::create_dir_all(part.parent().expect("parent")).expect("create staging");
         let file = File::create(&part).expect("create sparse part");
         file.set_len(content.len() as u64).expect("set length");
@@ -2898,16 +3551,37 @@ mod tests {
         let staging = config.patcher_dir.join("tmp/nte-native");
         fs::create_dir_all(staging.join("Res")).expect("create res staging");
         let md5 = "aa".repeat(16);
-        fs::write(staging.join(format!("Res/{md5}.1.part")), b"x").expect("content-addressed");
-        fs::write(staging.join(format!("Res/{md5}.1.ffff.part")), b"x").expect("keep");
-        fs::write(staging.join(format!("Res/{md5}.1.cb.idx")), b"x").expect("keep idx");
-        fs::write(staging.join("Res/bb.2.part"), b"x").expect("stale");
-        let plan = plan_of(vec![res_item("data/a.bin", &md5, 1)]);
+        let plan = plan_of(vec![
+            res_item("data/a.bin", &md5, 1),
+            res_item("data/other.bin", &"bb".repeat(16), 2),
+        ]);
+        // 计划内的暂存与续传索引都要保留.
+        let keep = res_temp(&config, "data/a.bin", &md5, 1, 0);
+        fs::write(&keep, b"x").expect("keep part");
+        let keep_index = range_index_path(&keep);
+        fs::write(&keep_index, b"x").expect("keep idx");
+        // 过期条目的路径应被清理.
+        let stale_index = res_temp(&config, "data/a.bin", &md5, 1, 1);
+        fs::write(&stale_index, b"x").expect("stale index");
+        let stale_path = staging.join(format!("Res/{md5}.1.ffff.part"));
+        fs::write(&stale_path, b"x").expect("stale path tag");
+        let stale_md5 = staging.join("Res/bb.2.part");
+        fs::write(&stale_md5, b"x").expect("stale md5");
+        // 未选中的计划项不参与本轮, 保留其暂存以便之后续传.
+        let untouched = staging.join(format!(
+            "Res/{}.2.{}.part",
+            "bb".repeat(16),
+            item_tag_for("data/other.bin", 0)
+        ));
+        fs::write(&untouched, b"x").expect("keep unselected item part");
+
         cleanup_stale_parts(&staging, &plan);
-        assert!(staging.join(format!("Res/{md5}.1.part")).exists());
-        assert!(staging.join(format!("Res/{md5}.1.ffff.part")).exists());
-        assert!(staging.join(format!("Res/{md5}.1.cb.idx")).exists());
-        assert!(!staging.join("Res/bb.2.part").exists());
+        assert!(keep.exists());
+        assert!(keep_index.exists());
+        assert!(untouched.exists(), "未选中计划项的暂存应保留");
+        assert!(!stale_index.exists());
+        assert!(!stale_path.exists());
+        assert!(!stale_md5.exists());
     }
 
     #[test]
@@ -2978,7 +3652,7 @@ mod tests {
         let cancelled = || false;
         let limiter = RateLimiter::new(0);
         let clock = DownloadClock::new();
-        let progress = Progress::new(&tx, 0, &cancelled, &limiter, &clock);
+        let progress = Progress::new(&tx, 0, 0, &cancelled, &limiter, &clock);
 
         progress.add_download(100);
         progress.add_apply(200, Duration::from_millis(3));
@@ -3046,7 +3720,7 @@ mod tests {
             &[(&hash, bytes.len() as u64)],
         );
         let final_path =
-            chain_final_temp(&config.patcher_dir.join("tmp/nte-native"), &item).unwrap();
+            chain_final_temp(&config.patcher_dir.join("tmp/nte-native"), &item, 0).unwrap();
         let cancelled = || final_path.is_file();
         let plan = plan_of(vec![item]);
         let report = apply_plan_observed_full(

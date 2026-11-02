@@ -109,6 +109,26 @@ impl UpdateItem {
     pub fn has_patch(&self) -> bool {
         !self.patches.is_empty()
     }
+
+    /// 相邻两跳产物同时存在时的暂存峰值.
+    pub(crate) fn patch_workspace(&self) -> u64 {
+        match self.patches.as_slice() {
+            [] => 0,
+            [patch] => patch.new_size,
+            patches => patches
+                .windows(2)
+                .map(|step| step[0].new_size.saturating_add(step[1].new_size))
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    /// 安装完成后仍会占用的额外空间, 不把缩小文件的收益提前借给其它链.
+    pub(crate) fn patch_disk_growth(&self) -> u64 {
+        self.patches
+            .first()
+            .map_or(0, |patch| self.size.saturating_sub(patch.old_size))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -125,6 +145,8 @@ pub struct UpdatePlan {
     pub max_threads: usize,
 }
 
+pub(crate) const PATCH_DISK_RESERVE: u64 = 256 * 1024 * 1024;
+
 impl UpdatePlan {
     pub fn total_bytes(&self) -> u64 {
         self.items.iter().map(|i| i.download_size).sum()
@@ -133,31 +155,30 @@ impl UpdatePlan {
     /// 下载与安装过程额外占用的磁盘空间.
     ///
     /// 补丁链会逐步生成完整文件, 下一步开始时上一步的产物仍然存在,
-    /// 因此按相邻两步的产物大小之和估算峰值; 补丁文件本身已计入下载量.
+    /// 因此按相邻两步的产物大小之和估算峰值; 另留足安装后的净增长和余量.
     pub fn required_disk_bytes(&self) -> u64 {
         let patch_workspace = self
             .items
             .iter()
-            .map(patch_chain_workspace)
+            .map(UpdateItem::patch_workspace)
             .max()
             .unwrap_or(0);
-        self.total_bytes().saturating_add(patch_workspace)
+        // 执行层按可用空间限制并发, 一条链的峰值即可作为最低预算.
+        let patch_growth = self.items.iter().fold(0u64, |total, item| {
+            total.saturating_add(item.patch_disk_growth())
+        });
+        self.total_bytes()
+            .saturating_add(patch_growth)
+            .saturating_add(patch_workspace)
+            .saturating_add(if self.items.iter().any(UpdateItem::has_patch) {
+                PATCH_DISK_RESERVE
+            } else {
+                0
+            })
     }
 
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
-    }
-}
-
-fn patch_chain_workspace(item: &UpdateItem) -> u64 {
-    match item.patches.as_slice() {
-        [] => 0,
-        [patch] => patch.new_size,
-        patches => patches
-            .windows(2)
-            .map(|step| step[0].new_size.saturating_add(step[1].new_size))
-            .max()
-            .unwrap_or(0),
     }
 }
 
@@ -1360,7 +1381,7 @@ mod tests {
         assert_eq!(patch.new_size, 200);
         assert_eq!(plan.items[0].download_size, 50);
         assert_eq!(plan.total_bytes(), 50);
-        assert_eq!(plan.required_disk_bytes(), 250);
+        assert_eq!(plan.required_disk_bytes(), 250 + 100 + PATCH_DISK_RESERVE);
 
         // 最后一跳来自旧构建（v 与远端 hash 不同）时仍然使用补丁：
         // newfile 是内容寻址 id，补丁输出就是目标内容，最终整文件 MD5 兜底。
@@ -1376,7 +1397,7 @@ mod tests {
         assert_eq!(plan.items[0].patches.len(), 1);
         assert_eq!(plan.items[0].patches[0].md5, patch_md5);
         assert_eq!(plan.items[0].download_size, 50);
-        assert_eq!(plan.required_disk_bytes(), 250);
+        assert_eq!(plan.required_disk_bytes(), 250 + 100 + PATCH_DISK_RESERVE);
 
         // 补丁体积不小于整包时直接下载整包
         let plan = check_bundle(
@@ -1686,7 +1707,10 @@ mod tests {
         assert_eq!(plan.items[0].patches[1].new_md5, new_md5);
         assert_eq!(plan.total_bytes(), 70);
         // 第二步开始时, 第一步生成的 200 字节中间产物仍在暂存目录.
-        assert_eq!(plan.required_disk_bytes(), 70 + 200 + 300);
+        assert_eq!(
+            plan.required_disk_bytes(),
+            70 + 200 + 300 + 200 + PATCH_DISK_RESERVE
+        );
 
         // 直达补丁更便宜时只走一步；同一对内容有多条边时取最小补丁
         let plan = check_bundle(
@@ -1818,7 +1842,45 @@ mod tests {
             ..Default::default()
         };
         // 120 + 500 与 500 + 300 中, 后者才是峰值.
-        assert_eq!(plan.required_disk_bytes(), 60 + 800);
+        assert_eq!(
+            plan.required_disk_bytes(),
+            60 + 800 + 300 + PATCH_DISK_RESERVE
+        );
+    }
+
+    #[test]
+    fn disk_budget_keeps_growth_from_completed_patch_items() {
+        let item = |path: &str, old_size, new_size| UpdateItem {
+            path: path.into(),
+            size: new_size,
+            md5: "aa".repeat(16),
+            reason: UpdateReason::Size,
+            kind: UpdateKind::Res {
+                res: res(path, &"aa".repeat(16), new_size),
+            },
+            patches: vec![PatchRef {
+                md5: "bb".repeat(16),
+                size: 10,
+                old_md5: "cc".repeat(16),
+                old_size,
+                new_md5: "aa".repeat(16),
+                new_size,
+            }],
+            download_size: 10,
+        };
+        let plan = UpdatePlan {
+            items: vec![
+                item("data/a.bin", 100, 200),
+                item("data/b.bin", 100, 300),
+                item("data/c.bin", 900, 100),
+            ],
+            ..Default::default()
+        };
+        // 三个补丁共 30 字节, 最大链产物 300 字节, 两个增长项共增加 300 字节.
+        assert_eq!(
+            plan.required_disk_bytes(),
+            30 + 300 + 300 + PATCH_DISK_RESERVE
+        );
     }
 
     #[test]
