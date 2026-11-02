@@ -114,17 +114,25 @@ test("导航、更新、设置、快捷键与启动关闭流程", async ({ page 
   await expect(page.locator("#launch-btn")).toHaveText(
     /正在(准备环境|启动后台|等待资源|启动游戏)/,
   );
-  await expect(page.locator("#launch-pause-btn")).toBeVisible();
-  await page.locator("#launch-pause-btn").click();
+  await expect(page.locator("#launch-btn")).toHaveAttribute(
+    "aria-label",
+    /暂停启动/,
+  );
+  // 暂停入口是整个按钮: 点文字一侧也能暂停。
+  await page.locator("#launch-btn").click({ position: { x: 40, y: 29 } });
   await expect(page.locator("#launch-btn")).toHaveText(/正在暂停/);
   await expect(page.locator("#launch-btn")).toHaveText(/启动游戏/);
-  await expect(page.locator("#launch-pause-btn")).toHaveCount(0);
+  await expect(page.locator("#launch-btn")).toHaveAttribute(
+    "aria-label",
+    "启动游戏",
+  );
 
   await page.locator("#launch-btn").click();
   await expect(page.locator("#launch-btn")).toHaveText(/关闭游戏/, {
     timeout: 10_000,
   });
-  await page.locator("#launch-btn").click();
+  // 关闭入口同样是整个按钮, 不只有右侧图标可点。
+  await page.locator("#launch-btn").click({ position: { x: 40, y: 29 } });
   await expect(page.locator("#launch-btn")).toHaveText(/正在关闭/);
   await expect(page.locator("#launch-btn")).toHaveText(/启动游戏/);
   expect(errors).toEqual([]);

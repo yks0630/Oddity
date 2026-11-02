@@ -1692,6 +1692,8 @@ describe("游戏会话", () => {
   });
 
   it("启动反馈期间忽略事件和重复操作, 启动成功后收起窗口", async () => {
+    // 前台启动没有暂停入口, 反馈期间的重复点击仍应被忽略。
+    backend.data.settings.launchMode = "official";
     const c = await boot();
     button("launch-btn").click();
     expect(c.state.game).toBe("launching");
@@ -1709,7 +1711,7 @@ describe("游戏会话", () => {
     expect(noticeMessage()).toBe("游戏已退出。");
   });
 
-  it("后台启动时只在主按钮展示阶段并露出暂停子按钮", async () => {
+  it("后台启动时主按钮展示阶段并允许整键暂停", async () => {
     const c = await boot();
     const startedAt = Date.now();
     backend.invoke.mockResolvedValueOnce({ pid: 123, mode: "background" });
@@ -1725,10 +1727,10 @@ describe("游戏会话", () => {
     expect(c.state.launch?.stage).toBe("preparing");
     await nextTick();
     expect(button("launch-btn").getAttribute("aria-label")).toBe(
-      "正在准备环境",
+      "正在准备环境，暂停启动",
     );
-    expect(button("launch-btn").getAttribute("aria-disabled")).toBe("true");
-    expect(button("launch-pause-btn").disabled).toBe(false);
+    expect(button("launch-btn").getAttribute("aria-disabled")).toBeNull();
+    expect(document.getElementById("launch-pause-btn")).toBeNull();
     backend.handler(
       session({
         running: true,
@@ -1741,9 +1743,9 @@ describe("游戏会话", () => {
     expect(c.state.launch?.stage).toBe("resources");
     expect(backend.invoke).not.toHaveBeenCalledWith("win_hide");
     expect(button("launch-btn").getAttribute("aria-label")).toBe(
-      "正在等待资源",
+      "正在等待资源，暂停启动",
     );
-    expect(button("launch-pause-btn").disabled).toBe(false);
+    expect(button("launch-btn").getAttribute("aria-disabled")).toBeNull();
   });
 
   it.each(["official", "direct"])("%s 启动不提供暂停入口", async (mode) => {
@@ -1755,6 +1757,8 @@ describe("游戏会话", () => {
     expect(c.launchView.value.pauseAvailable).toBe(false);
     expect(c.launchView.value.label).toBe("正在启动");
     expect(document.getElementById("launch-pause-btn")).toBeNull();
+    expect(button("launch-btn").getAttribute("aria-disabled")).toBe("true");
+    button("launch-btn").click();
     await c.pauseLaunch();
     c.handleLaunchAction();
     await flushPromises();
@@ -1830,10 +1834,10 @@ describe("游戏会话", () => {
     expect(c.state.game).toBe("launching");
     expect(c.state.launch?.stage).toBe("helper");
     expect(button("launch-btn").getAttribute("aria-label")).toBe(
-      "正在启动后台",
+      "正在启动后台，暂停启动",
     );
-    expect(button("launch-btn").getAttribute("aria-disabled")).toBe("true");
-    expect(button("launch-pause-btn").disabled).toBe(false);
+    expect(button("launch-btn").getAttribute("aria-disabled")).toBeNull();
+    expect(document.getElementById("launch-pause-btn")).toBeNull();
   });
 
   it("后台启动失败时清除阶段", async () => {
@@ -1862,7 +1866,7 @@ describe("游戏会话", () => {
     expect(noticeMessage()).toBe("官方后台未能在 180 秒内完成资源初始化.");
   });
 
-  it("暂停子按钮暂停后台启动且不提示错误", async () => {
+  it("点击启动按钮暂停后台启动且不提示错误", async () => {
     const c = await boot();
     let rejectLaunch!: (error: Error) => void;
     backend.invoke.mockImplementationOnce(
@@ -1893,17 +1897,85 @@ describe("游戏会话", () => {
         },
       }),
     );
-    button("launch-pause-btn").click();
+    button("launch-btn").click();
     await flushPromises();
     expect(backend.invoke).toHaveBeenCalledWith("cancel_launch");
     expect(c.state.game).toBe("launching");
     expect(c.state.launch?.cancelling).toBe(true);
     expect(button("launch-btn").getAttribute("aria-label")).toBe("正在暂停");
-    expect(button("launch-pause-btn").disabled).toBe(true);
+    expect(button("launch-btn").getAttribute("aria-disabled")).toBe("true");
     rejectLaunch(new Error("启动已暂停。"));
     await flushPromises();
     expect(c.state.game).toBe("idle");
     expect(noticeMessage()).toBeUndefined();
+  });
+
+  it("首个阶段事件到达前点击暂停也会立即反馈", async () => {
+    const c = await boot();
+    let resolveLaunch!: (value: { pid: number; mode: string }) => void;
+    backend.invoke.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveLaunch = resolve;
+        }),
+    );
+    button("launch-btn").click();
+    await nextTick();
+    expect(c.state.game).toBe("launching");
+    expect(c.state.launch).toBeNull();
+    // 启动命令尚未返回、还没有阶段事件, 此时点击暂停也要立即更新按钮。
+    button("launch-btn").click();
+    await nextTick();
+    expect(button("launch-btn").getAttribute("aria-label")).toBe("正在暂停");
+    expect(button("launch-btn").getAttribute("aria-disabled")).toBe("true");
+    await flushPromises();
+    expect(backend.invoke).toHaveBeenCalledWith("cancel_launch");
+    resolveLaunch({ pid: 123, mode: "background" });
+    await flushPromises();
+    expect(c.state.launch?.cancelling).toBe(true);
+    expect(button("launch-btn").getAttribute("aria-label")).toBe("正在暂停");
+  });
+
+  it("手柄确认键在启动中通过启动区暂停", async () => {
+    const c = await boot();
+    backend.invoke.mockResolvedValueOnce({ pid: 123, mode: "background" });
+    button("launch-btn").click();
+    backend.handler(
+      session({
+        running: false,
+        launch: {
+          stage: "preparing",
+          startedAt: Date.now(),
+          cancelling: false,
+        },
+      }),
+    );
+    await flushPromises();
+    await nextTick();
+    expect(c.state.game).toBe("launching");
+    // 手柄确认键作用于选中的启动区, 通过启动区转发到主按钮。
+    document
+      .getElementById("launch-region")!
+      .dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+      );
+    await nextTick();
+    expect(button("launch-btn").getAttribute("aria-label")).toBe("正在暂停");
+    await flushPromises();
+    expect(backend.invoke).toHaveBeenCalledWith("cancel_launch");
+  });
+
+  it("启动区只转发自身收到的确认键", async () => {
+    const c = await boot();
+    document
+      .getElementById("launch-btn")!
+      .dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+      );
+    await nextTick();
+    // 按钮自身的按键激活由浏览器默认行为触发, 启动区不重复处理。
+    expect(c.state.game).toBe("idle");
+    expect(backend.invoke).not.toHaveBeenCalledWith("launch_official");
   });
 
   it("手柄西键在启动中暂停启动", async () => {

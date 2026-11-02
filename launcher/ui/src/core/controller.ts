@@ -514,17 +514,19 @@ export const launchView = computed(() => {
   const pauseAvailable = launchPauseAvailable.value;
   const pausing =
     pauseAvailable &&
-    (launchCancelRequested || Boolean(state.launch?.cancelling));
+    (launchCancelRequested.value || Boolean(state.launch?.cancelling));
   const busy =
     runtimeEnvironmentBusy.value ||
     launching ||
     state.game === "closing" ||
     downloadBlocksLaunch();
+  // 可暂停时整个按钮就是暂停入口; 不提供暂停的启动方式仍保持禁用。
   const disabled =
     runtimeEnvironmentBusy.value ||
     state.game === "closing" ||
     downloadBlocksLaunch() ||
-    launching;
+    (launching && !pauseAvailable) ||
+    pausing;
   const copy = launching
     ? {
         label: pausing
@@ -533,7 +535,7 @@ export const launchView = computed(() => {
             ? (LAUNCH_STAGE_LABELS[state.launch?.stage ?? "preparing"] ??
               "正在启动")
             : "正在启动",
-        icon: "i-play",
+        icon: pauseAvailable ? "i-pause" : "i-play",
       }
     : state.game === "idle" &&
         (!state.bootstrap?.gameExists || downloadNeedsWork())
@@ -865,18 +867,19 @@ const LAUNCH_STAGE_LABELS: Record<LaunchStage, string> = {
   running: "正在启动游戏",
 };
 const LAUNCH_CANCELLED = "启动已暂停。";
-let launchCancelRequested = false;
+// 暂停请求先于首个阶段事件到达时, 按钮也要立刻反馈并禁用重复点击。
+const launchCancelRequested = ref(false);
 let launchHidePending = false;
 
 function resetLaunchFlags() {
-  launchCancelRequested = false;
+  launchCancelRequested.value = false;
   launchHidePending = false;
 }
 
 function requestLaunchHide() {
   if (!launchHidePending) return;
   launchHidePending = false;
-  launchCancelRequested = false;
+  launchCancelRequested.value = false;
   if (isDesktop()) void invoke("win_hide").catch(() => {});
 }
 
@@ -1648,7 +1651,7 @@ function applyGameStatus(
 
   if (status.launch) {
     const launch = status.launch;
-    const cancelling = launch.cancelling || launchCancelRequested;
+    const cancelling = launch.cancelling || launchCancelRequested.value;
     if (cancelling || launch.stage !== "running") {
       state.launch = launch;
       if (status.running) state.session = status;
@@ -1656,7 +1659,7 @@ function applyGameStatus(
       return;
     }
     state.launch = null;
-    launchCancelRequested = false;
+    launchCancelRequested.value = false;
     if (status.running) {
       state.session = status;
       if (!status.closing && state.game === "launching" && launchHidePending)
@@ -1674,7 +1677,7 @@ function applyGameStatus(
   if (status.running) {
     state.launch = null;
     state.session = status;
-    launchCancelRequested = false;
+    launchCancelRequested.value = false;
     setLaunchState(status.closing ? "closing" : "running");
     return;
   }
@@ -1715,7 +1718,7 @@ async function launchGame() {
   setLaunchState("launching");
   state.launch = null;
   launchHidePending = true;
-  launchCancelRequested = false;
+  launchCancelRequested.value = false;
   const startedAt = performance.now();
   const launchStartedAt = Date.now();
   lastLaunchStartedAt = launchStartedAt;
@@ -1729,7 +1732,7 @@ async function launchGame() {
         state.launch = {
           stage: "preparing",
           startedAt: launchStartedAt,
-          cancelling: launchCancelRequested,
+          cancelling: launchCancelRequested.value,
         };
       return;
     }
@@ -1760,7 +1763,7 @@ async function launchGame() {
   } catch (error) {
     if (epoch !== generation) return;
     const cancelled =
-      launchCancelRequested ||
+      launchCancelRequested.value ||
       (error instanceof Error ? error.message : String(error)) ===
         LAUNCH_CANCELLED;
     resetLaunchFlags();
@@ -1796,8 +1799,8 @@ async function launchGame() {
 export async function pauseLaunch() {
   const epoch = generation;
   if (!launchPauseAvailable.value) return;
-  if (launchCancelRequested || state.launch?.cancelling) return;
-  launchCancelRequested = true;
+  if (launchCancelRequested.value || state.launch?.cancelling) return;
+  launchCancelRequested.value = true;
   if (state.launch) state.launch = { ...state.launch, cancelling: true };
   try {
     const status = await invoke("cancel_launch");
@@ -1805,7 +1808,7 @@ export async function pauseLaunch() {
     if (status) applyGameStatus(status, { force: true });
   } catch (error) {
     if (epoch !== generation) return;
-    launchCancelRequested = false;
+    launchCancelRequested.value = false;
     let status = null;
     try {
       status = await invoke("game_status");

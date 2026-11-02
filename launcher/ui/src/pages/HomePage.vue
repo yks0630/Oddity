@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
-import { AnimatePresence, motion, useReducedMotion } from "motion-v";
+import { motion, useReducedMotion } from "motion-v";
 import { createTimeline } from "animejs";
 import {
   state,
@@ -10,13 +10,11 @@ import {
   homeDownloadNotice,
   showPage,
   handleLaunchAction,
-  pauseLaunch,
 } from "../core/controller";
 import { playerExpanded } from "../composables/useSceneMotion";
 import HomeGameRecords from "../components/HomeGameRecords.vue";
 import { gamepad } from "../core/gamepad";
 import GamepadGlyph from "../components/GamepadGlyph.vue";
-import BaseButton from "../components/BaseButton.vue";
 const isActive = computed(() => state.page === "home");
 const prefersReduced = useReducedMotion();
 const reduced = computed(() => form.reduceMotion || prefersReduced.value);
@@ -54,9 +52,24 @@ watch(label, (next) => {
 });
 onBeforeUnmount(() => labelTimeline?.cancel());
 
+// 启动中的可见文案仍是阶段进度, 可访问名称补上「暂停启动」这个实际动作。
+const launchAriaLabel = computed(() => {
+  const view = launchView.value;
+  return view.pauseAvailable && !view.pausing
+    ? `${view.label}，暂停启动`
+    : view.label;
+});
+
 function handleMainLaunchClick() {
   if (launchView.value.disabled) return;
   handleLaunchAction();
+}
+
+// 手柄确认键落在启动区时转给主按钮; 按钮自身的按键激活由浏览器处理, 不重复触发。
+function handleLaunchRegionKey(event: KeyboardEvent) {
+  if (event.target !== event.currentTarget) return;
+  event.preventDefault();
+  handleMainLaunchClick();
 }
 </script>
 
@@ -97,25 +110,18 @@ function handleMainLaunchClick() {
               :aria-label="
                 state.game === 'launching' ? launchView.label : undefined
               "
+              @keydown.enter="handleLaunchRegionKey"
             >
-              <motion.button
-                :while-hover="
-                  launchView.disabled ? undefined : { scale: 1.025, y: -2 }
-                "
-                :while-press="
-                  launchView.disabled ? undefined : { scale: 0.96, y: 1 }
-                "
-                :transition="{ type: 'spring', stiffness: 460, damping: 26 }"
+              <button
                 class="btn btn--primary btn--trailing hero__launch-main"
                 id="launch-btn"
                 @click="handleMainLaunchClick"
                 type="button"
                 :aria-busy="launchView.busy"
                 :aria-disabled="launchView.disabled || undefined"
-                :aria-label="launchView.label"
+                :aria-label="launchAriaLabel"
                 :class="{
-                  'is-busy': launchView.disabled && state.game !== 'launching',
-                  'is-launching': state.game === 'launching',
+                  'is-busy': launchView.disabled,
                   'is-running': state.game === 'running',
                 }"
               >
@@ -133,7 +139,7 @@ function handleMainLaunchClick() {
                   }"
                   >{{ displayedLabel }}</motion.span
                 >
-                <span v-if="state.game !== 'launching'" class="btn__icon"
+                <span class="btn__icon"
                   ><GamepadGlyph v-if="gamepad.active" button="west" /><svg
                     v-else
                     class="icon"
@@ -142,33 +148,7 @@ function handleMainLaunchClick() {
                   >
                     <use :href="'#' + launchView.icon"></use></svg
                 ></span>
-              </motion.button>
-              <AnimatePresence>
-                <motion.div
-                  v-if="launchView.pauseAvailable"
-                  class="hero__launch-sub"
-                  :initial="{ opacity: 0, scale: 0.78 }"
-                  :animate="{ opacity: 1, scale: 1 }"
-                  :exit="{ opacity: 0, scale: 0.78 }"
-                  :transition="{
-                    duration: reduced ? 0 : 0.16,
-                    ease: 'easeOut',
-                  }"
-                >
-                  <BaseButton
-                    id="launch-pause-btn"
-                    class="hero__launch-pause"
-                    variant="secondary"
-                    size="sm"
-                    icon="i-pause"
-                    icon-only
-                    data-pad-skip
-                    :aria-label="launchView.pausing ? '正在暂停' : '暂停启动'"
-                    :busy="launchView.pausing"
-                    @click="pauseLaunch"
-                  />
-                </motion.div>
-              </AnimatePresence>
+              </button>
             </div>
           </div>
           <div
