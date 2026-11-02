@@ -3,6 +3,8 @@ import { mount } from "@vue/test-utils";
 import { nextTick } from "vue";
 import GamepadOverlay from "../../../launcher/ui/src/components/GamepadOverlay.vue";
 import { gamepad, gamepadTarget } from "../../../launcher/ui/src/core/gamepad";
+import { gamepadActions } from "../../../launcher/ui/src/core/gamepadActions";
+import { fileRequest } from "../../../launcher/ui/src/core/filePicker";
 vi.mock("../../../launcher/ui/src/core/controller", () => ({
   form: { reduceMotion: true, theme: "light" },
   state: { page: "records" },
@@ -15,7 +17,13 @@ vi.mock("../../../launcher/ui/src/composables/useSceneMotion", async () => {
 vi.mock("../../../launcher/ui/src/core/gamepad", async () => {
   const { reactive, shallowRef, computed } = await import("vue");
   return {
-    gamepad: reactive({ active: true, pressing: false, navigation: false }),
+    gamepad: reactive({
+      active: true,
+      pressing: false,
+      navigation: false,
+      notification: false,
+      editing: null as HTMLInputElement | HTMLTextAreaElement | null,
+    }),
     gamepadTarget: shallowRef<HTMLElement | null>(null),
     gamepadViewport: () => ({ top: 0, bottom: 760 }),
     gamepadFamily: computed(() => "dualsense"),
@@ -156,4 +164,82 @@ it("容器位移动画期间按稳定位置定位, 非位移过渡仍逐帧跟�
   expect(select.style.transform).toContain("translateY(296px)");
 
   wrapper.unmount();
+});
+
+it("屏幕键盘和文件选择框显示各自的快捷键提示", async () => {
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      disconnect() {}
+    },
+  );
+  document.body.innerHTML = '<section class="page is-active"></section>';
+  const wrapper = mount(GamepadOverlay, { attachTo: document.body });
+
+  gamepad.editing = document.createElement("input");
+  gamepadActions.keyboard = {
+    cycle: vi.fn(),
+    commit: vi.fn(),
+    backspace: vi.fn(),
+    clear: vi.fn(),
+  };
+  await nextTick();
+  expect(document.querySelector('[data-hint="select"]')?.textContent).toContain(
+    "切换布局",
+  );
+  expect(document.querySelector('[data-hint="start"]')?.textContent).toContain(
+    "保存",
+  );
+  expect(document.querySelector('[data-hint="west"]')?.textContent).toContain(
+    "退格",
+  );
+
+  const numeric = document.createElement("input");
+  numeric.type = "number";
+  gamepad.editing = numeric;
+  await nextTick();
+  expect(document.querySelector('[data-hint="clear"]')?.textContent).toContain(
+    "清空",
+  );
+  expect(document.querySelector('[data-hint="select"]')).toBeNull();
+
+  gamepadActions.keyboard = null;
+  gamepad.editing = null;
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  const files = document.createElement("div");
+  files.className = "pad-files";
+  const target = document.createElement("button");
+  files.append(target);
+  modal.append(files);
+  document.body.append(modal);
+  gamepadTarget.value = target;
+  fileRequest.value = {
+    title: "目录",
+    directory: true,
+    save: false,
+    extensions: [],
+    resolve: vi.fn(),
+  };
+  gamepadActions.picker = {
+    primary: vi.fn(),
+    parent: vi.fn(),
+    reset: vi.fn(),
+  };
+  await nextTick();
+  expect(document.querySelector('[data-hint="start"]')?.textContent).toContain(
+    "选择",
+  );
+  expect(document.querySelector('[data-hint="west"]')?.textContent).toContain(
+    "上一级",
+  );
+  expect(document.querySelector('[data-hint="reset"]')?.textContent).toContain(
+    "重置",
+  );
+
+  wrapper.unmount();
+  gamepadActions.picker = null;
+  fileRequest.value = null;
+  gamepadTarget.value = null;
 });

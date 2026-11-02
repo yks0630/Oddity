@@ -3,6 +3,8 @@ import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { motion, useReducedMotion } from "motion-v";
 import { createTimeline } from "animejs";
 import { gamepad, gamepadTarget, gamepadViewport } from "../core/gamepad";
+import { gamepadActions } from "../core/gamepadActions";
+import { fileRequest } from "../core/filePicker";
 import { form, launchPauseAvailable, state } from "../core/controller";
 import { playerExpanded, sceneEntering } from "../composables/useSceneMotion";
 import GamepadHints from "./GamepadHints.vue";
@@ -241,6 +243,16 @@ const local = computed(
     selectOpen.value ||
     !!gamepadTarget.value?.closest(".modal,[data-pad-modal]"),
 );
+const keyboardNumeric = computed(
+  () =>
+    gamepad.editing instanceof HTMLInputElement &&
+    ["number", "tel", "time"].includes(gamepad.editing.type),
+);
+const pickerTop = computed(
+  () =>
+    !gamepad.notification &&
+    !!gamepadTarget.value?.closest(".modal")?.querySelector(".pad-files"),
+);
 const hints = computed<GamepadHint[]>(() => {
   if (gamepad.windowControls)
     return [
@@ -290,6 +302,30 @@ const hints = computed<GamepadHint[]>(() => {
       { id: "move", buttons: ["move"], label: "浏览" },
       { id: "back", buttons: ["back"], label: "结束浏览" },
     ];
+  if (gamepadActions.keyboard && gamepad.editing && !gamepad.notification) {
+    return keyboardNumeric.value
+      ? [
+          { id: "start", buttons: ["start"], label: "保存" },
+          { id: "west", buttons: ["west"], label: "退格" },
+          { id: "clear", buttons: ["l3", "r3"], label: "清空" },
+        ]
+      : [
+          { id: "select", buttons: ["select"], label: "切换布局" },
+          { id: "start", buttons: ["start"], label: "保存" },
+          { id: "west", buttons: ["west"], label: "退格" },
+        ];
+  }
+  if (gamepadActions.picker && pickerTop.value) {
+    const request = fileRequest.value;
+    const start = request?.save ? "保存" : request?.directory ? "选择" : null;
+    return [
+      start
+        ? { id: "start", buttons: ["start"], label: start }
+        : { id: "confirm", buttons: ["confirm"], label: "选择文件" },
+      { id: "west", buttons: ["west"], label: "上一级" },
+      { id: "reset", buttons: ["l3", "r3"], label: "重置" },
+    ];
+  }
   const back = {
     id: "back",
     buttons: ["back"] as const,

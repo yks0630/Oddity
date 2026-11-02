@@ -4,6 +4,7 @@ import {
   browserGamepadFeedback,
   createBrowserGamepadSource,
 } from "./gamepadBrowser";
+import { gamepadActions } from "./gamepadActions";
 import {
   form,
   state,
@@ -413,6 +414,52 @@ export function createGamepadNavigation() {
   }
   async function press(button: number) {
     refresh();
+    if (!gamepad.notification && !gamepad.windowControls) {
+      const keyboard = gamepadActions.keyboard;
+      if (keyboard && gamepad.editing) {
+        if (button === 4) {
+          keyboard.cycle();
+          await nextTick();
+          refresh();
+          return;
+        }
+        if (button === 6) {
+          keyboard.commit();
+          await nextTick();
+          refresh();
+          return;
+        }
+        if (button === 2) {
+          keyboard.backspace();
+          return;
+        }
+        if (button === 7 || button === 8) {
+          keyboard.clear();
+          return;
+        }
+      }
+      const picker = gamepadActions.picker;
+      if (picker && modal()?.querySelector(".pad-files")) {
+        if (button === 6) {
+          picker.primary();
+          await nextTick();
+          refresh();
+          return;
+        }
+        if (button === 2) {
+          picker.parent();
+          await nextTick();
+          refresh();
+          return;
+        }
+        if (button === 7 || button === 8) {
+          picker.reset();
+          await nextTick();
+          refresh();
+          return;
+        }
+      }
+    }
     const target = gamepadTarget.value;
     if (!modal() && !gamepad.windowControls && state.page === "home") {
       if (button === 2) {

@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { fileRequest, type FileListing } from "../core/filePicker";
 import { invoke } from "../core/api";
 import { form } from "../core/controller";
+import { gamepadActions } from "../core/gamepadActions";
 import BaseModal from "./BaseModal.vue";
 import BaseButton from "./BaseButton.vue";
 import BaseInput from "./BaseInput.vue";
@@ -14,6 +15,8 @@ const hidden = ref(false);
 const error = ref("");
 const busy = ref(false);
 const overwrite = ref(false);
+const initialPath = ref<string | null>(null);
+const initialName = ref("");
 let requestGeneration = 0;
 let browseGeneration = 0;
 const entries = computed(
@@ -36,7 +39,7 @@ function close(value: string | null = null) {
   fileRequest.value = null;
   request?.resolve(value);
 }
-async function browse(destination?: string) {
+async function browse(destination?: string, initial = false) {
   const request = requestGeneration;
   const generation = ++browseGeneration;
   listing.value = null;
@@ -50,7 +53,10 @@ async function browse(destination?: string) {
       error.value = String(cause);
     return null;
   });
-  if (request !== requestGeneration || generation !== browseGeneration) return;
+  if (request !== requestGeneration) return;
+  // 用户可能在首次加载完成前就跳到别的目录, 重置点仍取首次请求的结果.
+  if (initial && result) initialPath.value = result.path;
+  if (generation !== browseGeneration) return;
   if (result) {
     listing.value = result;
     path.value = result.path;
@@ -63,16 +69,24 @@ watch(
     requestGeneration++;
     busy.value = false;
     listing.value = null;
-    if (!request) return;
+    if (!request) {
+      if (gamepadActions.picker) gamepadActions.picker = null;
+      return;
+    }
     name.value = "";
     hidden.value = false;
+    initialPath.value = null;
+    initialName.value = "";
     const initial = request.defaultPath ?? "";
     if (request.save) name.value = initial.split("/").at(-1) ?? "";
+    initialName.value = name.value;
     const directory = request.save
       ? initial.slice(0, initial.lastIndexOf("/") + 1)
       : initial;
+    initialPath.value = directory || null;
     path.value = directory;
-    void browse(directory || undefined);
+    gamepadActions.picker = { primary, parent, reset };
+    void browse(directory || undefined, true);
   },
   { flush: "sync" },
 );
@@ -113,7 +127,25 @@ function saveFile() {
   }
   close(`${listing.value.path.replace(/\/$/, "")}/${filename}`);
 }
-onBeforeUnmount(() => close());
+function primary() {
+  const request = fileRequest.value;
+  if (!request || !listing.value || busy.value) return;
+  if (request.directory) close(listing.value.path);
+  else if (request.save) saveFile();
+}
+function parent() {
+  if (!listing.value?.parent || busy.value) return;
+  void browse(listing.value.parent);
+}
+function reset() {
+  if (!initialPath.value || busy.value) return;
+  name.value = initialName.value;
+  void browse(initialPath.value);
+}
+onBeforeUnmount(() => {
+  if (gamepadActions.picker) gamepadActions.picker = null;
+  close();
+});
 </script>
 <template>
   <BaseModal

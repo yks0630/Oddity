@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { motion } from "motion-v";
 import { gamepad } from "../core/gamepad";
+import { gamepadActions } from "../core/gamepadActions";
 import { useControlMotion } from "../composables/useControlMotion";
 import BaseButton from "./BaseButton.vue";
 const draft = ref("");
@@ -20,9 +21,20 @@ watch(
       shift.value = false;
       symbols.value = false;
       error.value = "";
+      gamepadActions.keyboard = {
+        cycle: cycleLayout,
+        commit,
+        backspace,
+        clear,
+      };
+    } else if (gamepadActions.keyboard) {
+      gamepadActions.keyboard = null;
     }
   },
 );
+onBeforeUnmount(() => {
+  if (gamepadActions.keyboard) gamepadActions.keyboard = null;
+});
 const numeric = computed(
   () =>
     gamepad.editing instanceof HTMLInputElement &&
@@ -46,6 +58,25 @@ const display = computed(() =>
     ? "•".repeat(draft.value.length)
     : draft.value || (time.value ? "HH:mm" : "输入内容"),
 );
+function cycleLayout() {
+  if (numeric.value) return;
+  if (symbols.value) {
+    symbols.value = false;
+    shift.value = false;
+  } else if (shift.value) {
+    shift.value = false;
+    symbols.value = true;
+  } else {
+    shift.value = true;
+  }
+}
+function backspace() {
+  draft.value = draft.value.slice(0, -1);
+}
+function clear() {
+  draft.value = "";
+  error.value = "";
+}
 function commit() {
   const field = gamepad.editing;
   if (!field) return;

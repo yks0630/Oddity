@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { reactive, ref, nextTick } from "vue";
-import { mount } from "@vue/test-utils";
+import { flushPromises, mount } from "@vue/test-utils";
 vi.mock("../../../launcher/ui/src/core/controller", async () => {
   const { reactive } = await import("vue");
   const { defaultGamepadOptions } =
@@ -42,6 +42,8 @@ import { playerExpanded } from "../../../launcher/ui/src/composables/useSceneMot
 import { settingsNavigation } from "../../../launcher/ui/src/core/settingsCatalog";
 import BaseSelect from "../../../launcher/ui/src/components/BaseSelect.vue";
 import GamepadKeyboard from "../../../launcher/ui/src/components/GamepadKeyboard.vue";
+import GamepadFilePicker from "../../../launcher/ui/src/components/GamepadFilePicker.vue";
+import { fileRequest } from "../../../launcher/ui/src/core/filePicker";
 let navigation: ReturnType<typeof createGamepadNavigation>;
 let rects: Map<Element, DOMRect>;
 function region(html: string) {
@@ -569,6 +571,106 @@ describe("手柄导航", () => {
     );
     expect(gamepad.editing).toBe(null);
     wrapper.unmount();
+  });
+  it("屏幕键盘支持布局切换、退格、清空和 start 提交", async () => {
+    region(
+      '<section class="page is-active"><input id="field" value="abc"></section>',
+    );
+    const wrapper = mount(GamepadKeyboard, { attachTo: document.body });
+    navigation.refresh();
+    await navigation.press(0);
+    await nextTick();
+    expect(wrapper.get(".pad-keyboard__display").text()).toBe("abc");
+
+    await navigation.press(4);
+    expect(wrapper.text()).toContain("QWERTYUIOP");
+    await navigation.press(4);
+    expect(wrapper.text()).toContain("!@#$%^&*()");
+    await navigation.press(4);
+    expect(wrapper.text()).toContain("qwertyuiop");
+
+    await navigation.press(2);
+    expect(wrapper.get(".pad-keyboard__display").text()).toBe("ab");
+    await navigation.press(7);
+    expect(wrapper.get(".pad-keyboard__display").text()).toBe("输入内容");
+    await navigation.press(2);
+    expect(wrapper.get(".pad-keyboard__display").text()).toBe("输入内容");
+
+    await navigation.press(6);
+    expect((document.getElementById("field") as HTMLInputElement).value).toBe(
+      "",
+    );
+    expect(gamepad.editing).toBe(null);
+    wrapper.unmount();
+  });
+  it("数字键盘的 select 不切换布局, R3 仍可清空", async () => {
+    region(
+      '<section class="page is-active"><input id="number" type="number" value="12"></section>',
+    );
+    const wrapper = mount(GamepadKeyboard, { attachTo: document.body });
+    navigation.refresh();
+    await navigation.press(0);
+    await nextTick();
+    await navigation.press(4);
+    expect(wrapper.text()).toContain("789");
+    expect(wrapper.text()).not.toContain("q");
+    await navigation.press(8);
+    expect(wrapper.get(".pad-keyboard__display").text()).toBe("输入内容");
+    wrapper.unmount();
+  });
+  it("文件选择框的 start/上一级/重置走手柄分发", async () => {
+    bridge.invoke.mockImplementation(
+      async (command: string, args?: { path?: string | null }) => {
+        if (command !== "browse_files") return null;
+        const path = args?.path ?? null;
+        if (path === "/home")
+          return { path: "/home", parent: null, home: "/home", entries: [] };
+        return {
+          path: "/home/user",
+          parent: "/home",
+          home: "/home",
+          entries: [],
+        };
+      },
+    );
+    const wrapper = mount(GamepadFilePicker, {
+      attachTo: document.body,
+      global: {
+        stubs: { BaseModal: { template: '<div class="modal"><slot /></div>' } },
+      },
+    });
+    const resolve = vi.fn();
+    fileRequest.value = {
+      title: "目录",
+      directory: true,
+      save: false,
+      extensions: [],
+      resolve,
+    };
+    await flushPromises();
+    const modal = document.querySelector<HTMLElement>(".modal")!;
+    rects.set(modal, new DOMRect(0, 0, 600, 400));
+    const pathInput = document.getElementById("pad-file-path")!;
+    rects.set(pathInput, new DOMRect(20, 20, 300, 40));
+    navigation.refresh();
+    expect(gamepadTarget.value).toBe(pathInput);
+
+    await navigation.press(2);
+    await flushPromises();
+    expect(bridge.invoke).toHaveBeenCalledWith("browse_files", {
+      path: "/home",
+    });
+
+    await navigation.press(8);
+    await flushPromises();
+    expect(bridge.invoke).toHaveBeenCalledWith("browse_files", {
+      path: "/home/user",
+    });
+
+    await navigation.press(6);
+    expect(resolve).toHaveBeenCalledWith("/home/user");
+    wrapper.unmount();
+    fileRequest.value = null;
   });
 });
 

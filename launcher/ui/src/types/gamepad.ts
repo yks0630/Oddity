@@ -134,6 +134,9 @@ export type GamepadButton =
   | "lt"
   | "rt"
   | "move"
+  | "select"
+  | "start"
+  | "l3"
   | "r3";
 export interface GamepadHint {
   id: string;

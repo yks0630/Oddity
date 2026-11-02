@@ -8,6 +8,7 @@ import {
   fileRequest,
   type FileListing,
 } from "../../../launcher/ui/src/core/filePicker";
+import { gamepadActions } from "../../../launcher/ui/src/core/gamepadActions";
 import { buildPlaytimeStats } from "../../../launcher/ui/src/core/playtime";
 
 const api = vi.hoisted(() => ({ invoke: vi.fn() }));
@@ -28,11 +29,11 @@ const folder = (
   path: string,
   entries: FileListing["entries"] = [],
 ): FileListing => ({ path, parent: "/", home: "/home", entries });
-function renderPicker(save = false) {
+function renderPicker(save = false, defaultPath?: string) {
   wrapper = mount(GamepadFilePicker, {
     global: {
       stubs: {
-        BaseModal: { template: "<div><slot /></div>" },
+        BaseModal: { template: '<div class="modal"><slot /></div>' },
         BaseSwitch: true,
         BaseButton: {
           props: ["busy", "disabled"],
@@ -54,6 +55,7 @@ function renderPicker(save = false) {
     directory: !save,
     save,
     extensions: save ? ["png"] : [],
+    defaultPath,
     resolve,
   };
   return resolve;
@@ -173,6 +175,66 @@ describe("文件选择器请求与最终路径", () => {
     expect(button("选择此文件夹").attributes("disabled")).toBeDefined();
     expect(resolve).not.toHaveBeenCalled();
     expect(wrapper.text()).toContain("无权访问");
+  });
+  it("手柄快捷键确认、上一级和重置", async () => {
+    const calls: (string | null)[] = [];
+    api.invoke.mockImplementation((_command, args) => {
+      const path = (args as { path?: string | null } | undefined)?.path ?? null;
+      calls.push(path);
+      return Promise.resolve(
+        path === "/home"
+          ? { ...folder("/home"), parent: null }
+          : { ...folder("/home/user"), parent: "/home" },
+      );
+    });
+    const resolve = renderPicker();
+    await flushPromises();
+    expect(calls).toEqual([null]);
+    expect(gamepadActions.picker).not.toBeNull();
+
+    gamepadActions.picker!.parent();
+    await flushPromises();
+    expect(calls.at(-1)).toBe("/home");
+    expect(
+      (wrapper.get("#pad-file-path").element as HTMLInputElement).value,
+    ).toBe("/home");
+
+    gamepadActions.picker!.reset();
+    await flushPromises();
+    expect(calls.at(-1)).toBe("/home/user");
+    expect(
+      (wrapper.get("#pad-file-path").element as HTMLInputElement).value,
+    ).toBe("/home/user");
+
+    gamepadActions.picker!.primary();
+    expect(resolve).toHaveBeenCalledWith("/home/user");
+  });
+  it("手柄 start 保存保留同名覆盖二次确认", async () => {
+    api.invoke.mockResolvedValue(
+      folder("/home", [
+        { name: "poster.png", path: "/home/poster.png", directory: false },
+      ]),
+    );
+    const resolve = renderPicker(true);
+    await flushPromises();
+    await wrapper.get("#pad-file-name").setValue("poster.png");
+    gamepadActions.picker!.primary();
+    await flushPromises();
+    expect(resolve).not.toHaveBeenCalled();
+    expect(wrapper.text()).toContain("再次确认将覆盖");
+    gamepadActions.picker!.primary();
+    expect(resolve).toHaveBeenCalledWith("/home/poster.png");
+  });
+  it("手柄重置恢复默认文件名", async () => {
+    api.invoke.mockResolvedValue(folder("/home"));
+    renderPicker(true, "/home/poster.png");
+    await flushPromises();
+    await wrapper.get("#pad-file-name").setValue("changed.png");
+    gamepadActions.picker!.reset();
+    await flushPromises();
+    expect(
+      (wrapper.get("#pad-file-name").element as HTMLInputElement).value,
+    ).toBe("poster.png");
   });
 });
 describe("图表键盘读屏信息", () => {
