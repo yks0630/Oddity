@@ -6,7 +6,7 @@ use nte_core::game;
 use nte_core::game::check::CheckOptions;
 use nte_core::game::download::ApplyOptions;
 use nte_core::manifest::Manifest;
-use nte_core::{update, version};
+use nte_core::{update, updates, version};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -252,6 +252,7 @@ fn game_apply(launcher: &LauncherConfig, args: &[String]) -> Result<()> {
         only: flag_value(args, "--only"),
         force: args.iter().any(|a| a == "--force"),
         update_ledger: true,
+        probe_cdns: !updates::metered().is_metered(),
     };
     let selected: Vec<_> = plan
         .items

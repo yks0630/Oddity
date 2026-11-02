@@ -10,7 +10,7 @@ use nte_core::config::LauncherConfig;
 use nte_core::game::check::CheckOptions;
 use nte_core::game::download::ApplyOptions;
 use nte_core::throttle::RateLimiter;
-use nte_core::{disk, game, install, update};
+use nte_core::{disk, game, install, update, updates};
 
 use crate::{game_exe_for, selected_install_root, session_alive, AppState, Settings};
 
@@ -439,10 +439,14 @@ fn run_plan(
             }
         });
     };
+    let apply_options = ApplyOptions {
+        probe_cdns: !updates::metered().is_metered(),
+        ..ApplyOptions::default()
+    };
     let report = game::download::apply_plan_observed_full(
         &game_config,
         &plan,
-        &ApplyOptions::default(),
+        &apply_options,
         settings.updates.limit_bytes_per_second,
         &mut on_file,
         &mut on_bytes,

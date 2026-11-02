@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use md5::Digest as _;
 
@@ -22,6 +22,8 @@ pub struct ApplyOptions {
     pub only: Option<String>,
     pub force: bool,
     pub update_ledger: bool,
+    /// 下载前是否允许给 CDN 测速; 计费网络等策略由调用方关闭.
+    pub probe_cdns: bool,
 }
 
 impl Default for ApplyOptions {
@@ -31,6 +33,7 @@ impl Default for ApplyOptions {
             only: None,
             force: false,
             update_ledger: true,
+            probe_cdns: true,
         }
     }
 }
@@ -87,6 +90,18 @@ const RANGE_RETRIES: usize = 2;
 #[cfg(test)]
 const RANGE_RETRIES: usize = 1;
 const SMALL_TARGET_HASH: u64 = 20 * 1024 * 1024;
+/// 更新前测速的采样上限; 只用来选路, 不计入下载进度.
+#[cfg(not(test))]
+const CDN_PROBE_BYTES: u64 = 2 * 1024 * 1024;
+#[cfg(test)]
+const CDN_PROBE_BYTES: u64 = 64 * 1024;
+/// 单个 CDN 的测速时间上限.
+const CDN_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+/// 计划下载量太小时, 测速的流量和延迟不划算, 直接按配置顺序下载.
+#[cfg(not(test))]
+const CDN_PROBE_MIN_BYTES: u64 = 32 * 1024 * 1024;
+#[cfg(test)]
+const CDN_PROBE_MIN_BYTES: u64 = 64 * 1024;
 
 enum WorkerEvent {
     Started {
@@ -330,6 +345,19 @@ pub fn apply_plan_observed_full(
     // 多个文件已经用满连接数时，每个大文件只开一条分块连接；只有一个
     // 大文件时才把整组连接都用于它的分块下载。
     worker_config.max_threads = range_threads;
+    // 大任务开始前给 CDN 做一次小样本测速; 失败或条件不满足时沿用配置顺序.
+    let download_bytes: u64 = selected.iter().map(|item| item.download_size).sum();
+    if opts.probe_cdns
+        && cdn_probe_is_worthwhile(
+            worker_config.cdns.len(),
+            download_bytes,
+            limit_bytes_per_second,
+        )
+    {
+        if let Some(order) = rank_cdns(&worker_config, &selected, &http, cancelled) {
+            worker_config.cdns = order;
+        }
+    }
     let worker_config = &worker_config;
     let next = AtomicUsize::new(0);
     let install_lock = Mutex::new(());
@@ -1551,6 +1579,95 @@ pub fn res_url(config: &GameUpdateConfig, md5: &str, size: u64) -> Result<String
     ))
 }
 
+/// 测速只在大任务、多节点且未限速时进行; 计费网络等外部条件由调用方排除.
+fn cdn_probe_is_worthwhile(
+    cdn_count: usize,
+    download_bytes: u64,
+    limit_bytes_per_second: u64,
+) -> bool {
+    cdn_count > 1 && download_bytes >= CDN_PROBE_MIN_BYTES && limit_bytes_per_second == 0
+}
+
+/// 从计划里挑最大的文件做采样, 返回它的原始 URL 和可用大小.
+fn cdn_probe_target(config: &GameUpdateConfig, items: &[&UpdateItem]) -> Option<(String, u64)> {
+    items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            UpdateKind::Res { res } => res_url(config, &res.md5, res.filesize)
+                .ok()
+                .map(|url| (url, res.filesize)),
+            UpdateKind::PakEntry {
+                pak_md5, pak_size, ..
+            } => res_url(config, pak_md5, *pak_size)
+                .ok()
+                .map(|url| (url, *pak_size)),
+        })
+        .filter(|(_, size)| *size > 0)
+        .max_by_key(|(_, size)| *size)
+}
+
+/// 按实测吞吐把 CDN 从快到慢排序; 没有任何样本时返回 None, 保持配置顺序.
+fn rank_cdns(
+    config: &GameUpdateConfig,
+    items: &[&UpdateItem],
+    http: &HttpClient,
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> Option<Vec<String>> {
+    let (url, size) = cdn_probe_target(config, items)?;
+    let want = size.min(CDN_PROBE_BYTES);
+    let mut rates: Vec<(usize, u64)> = Vec::with_capacity(config.cdns.len());
+    for (index, cdn) in config.cdns.iter().enumerate() {
+        if cancelled() {
+            return None;
+        }
+        let probe_url = request_url(config, cdn, index, &url);
+        rates.push((index, probe_rate(http, &probe_url, want)));
+    }
+    if rates.iter().all(|(_, rate)| *rate == 0) {
+        return None;
+    }
+    // 稳定排序: 同样快的节点保持配置顺序, 测速失败的排到最后.
+    rates.sort_by_key(|left| std::cmp::Reverse(left.1));
+    Some(
+        rates
+            .into_iter()
+            .map(|(index, _)| config.cdns[index].clone())
+            .collect(),
+    )
+}
+
+/// 读取一小段完整样本并返回吞吐 (字节/秒); 请求失败、读取中断或没取满时按 0 处理.
+fn probe_rate(http: &HttpClient, url: &str, want: u64) -> u64 {
+    let started = Instant::now();
+    let mut response = match http
+        .request(url, CDN_PROBE_TIMEOUT)
+        .header("Range", format!("bytes=0-{}", want - 1))
+        .call()
+    {
+        Ok(response) => response,
+        Err(_) => return 0,
+    };
+    let mut reader = response.body_mut().as_reader();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut received = 0u64;
+    while received < want {
+        if started.elapsed() >= CDN_PROBE_TIMEOUT {
+            break;
+        }
+        let remaining = (want - received).min(buffer.len() as u64) as usize;
+        match reader.read(&mut buffer[..remaining]) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => received += read as u64,
+        }
+    }
+    // 提前结束、读取失败或超时都会让样本不完整, 不能拿这一小段算吞吐.
+    if received < want {
+        return 0;
+    }
+    let elapsed = started.elapsed().as_nanos().max(1);
+    ((received as u128 * 1_000_000_000) / elapsed).min(u64::MAX as u128) as u64
+}
+
 fn verify(path: &Path, expected_size: u64, expected_md5: &str) -> Result<bool> {
     verify_cancellable(path, expected_size, expected_md5, &|| false)
 }
@@ -2101,6 +2218,150 @@ mod tests {
         assert_eq!(dir.read("install/data/a.bin"), content);
         assert!(server.hits(&format!("/bad/{suffix}")) >= 1);
         assert_eq!(server.hits(&format!("/good/{suffix}")), 1);
+    }
+
+    #[test]
+    fn cdn_probe_needs_multiple_nodes_a_large_plan_and_no_limit() {
+        assert!(cdn_probe_is_worthwhile(2, CDN_PROBE_MIN_BYTES, 0));
+        assert!(!cdn_probe_is_worthwhile(1, CDN_PROBE_MIN_BYTES, 0));
+        assert!(!cdn_probe_is_worthwhile(2, CDN_PROBE_MIN_BYTES - 1, 0));
+        assert!(!cdn_probe_is_worthwhile(2, CDN_PROBE_MIN_BYTES, 4096));
+    }
+
+    #[test]
+    fn cdn_probe_keeps_the_configured_order_when_nothing_responds() {
+        let dir = TempDir::new("dl-probe-none");
+        let server = HttpServer::start();
+        let mut config = config_for(&dir);
+        config.cdns = vec![server.url("/a"), server.url("/b")];
+        let item = res_item("data/big.bin", &"ab".repeat(16), 128 * 1024);
+        let http = HttpClient::new();
+
+        assert!(rank_cdns(&config, &[&item], &http, &|| true).is_none());
+        assert!(rank_cdns(&config, &[&item], &http, &|| false).is_none());
+    }
+
+    #[test]
+    fn truncated_probe_samples_are_rejected() {
+        let dir = TempDir::new("dl-probe-truncated");
+        let server = HttpServer::start();
+        let mut config = config_for(&dir);
+        config.cdns = vec![server.url("/cdn")];
+        let content = "w".repeat(256 * 1024);
+        let md5 = crate::update::md5_bytes(content.as_bytes());
+        let path = res_path(&md5, content.len() as u64);
+        let url = res_url(&config, &md5, content.len() as u64).expect("probe url");
+        let http = HttpClient::new();
+
+        // 只返回一小段就正常结束: 样本不完整, 不能因为耗时短被当成快节点.
+        server.route(&path, &content[..1024]);
+        assert_eq!(probe_rate(&http, &url, CDN_PROBE_BYTES), 0);
+
+        server.route(&path, &content);
+        assert!(probe_rate(&http, &url, CDN_PROBE_BYTES) > 0);
+    }
+
+    #[test]
+    fn cdn_probe_samples_the_pak_for_pak_entries() {
+        let dir = TempDir::new("dl-probe-pak");
+        let mut config = config_for(&dir);
+        config.cdns = vec![
+            "https://cdn.test/clientRes".to_string(),
+            "https://backup.test/res".to_string(),
+        ];
+        let pak_size = 8 * 1024 * 1024;
+        let item = pak_item(
+            "Client/Content/Paks/pakchunk0.pak",
+            &"cd".repeat(16),
+            10,
+            4,
+            pak_size,
+        );
+
+        let (url, size) = cdn_probe_target(&config, &[&item]).expect("probe target");
+        assert_eq!(size, pak_size);
+        assert_eq!(
+            url,
+            format!(
+                "https://cdn.test/clientRes/{BRANCH}/Res/a/{}.{pak_size}",
+                "aa".repeat(16)
+            )
+        );
+    }
+
+    #[test]
+    fn faster_cdn_is_picked_before_a_large_download() {
+        let dir = TempDir::new("dl-probe-order");
+        let slow = HttpServer::start();
+        let fast = HttpServer::start();
+        let mut config = config_for(&dir);
+        config.cdns = vec![slow.url("/cdnA"), fast.url("/cdnB")];
+        let content = "x".repeat(256 * 1024);
+        let md5 = crate::update::md5_bytes(content.as_bytes());
+        let suffix = format!(
+            "{BRANCH}/Res/{}/{md5}.{}",
+            md5.chars().next().unwrap_or('0'),
+            content.len()
+        );
+        let slow_path = format!("/cdnA/{suffix}");
+        let fast_path = format!("/cdnB/{suffix}");
+        let (entered, release) = slow.route_blocked(&slow_path, &content);
+        let gate = std::thread::spawn(move || {
+            if entered.recv_timeout(Duration::from_secs(2)).is_ok() {
+                // 拉开两边的采样耗时, 避免本机调度噪声决定排序.
+                std::thread::sleep(Duration::from_millis(300));
+                let _ = release.send(());
+            }
+        });
+        fast.route(&fast_path, &content);
+
+        let mut plan = plan_of(vec![res_item("data/big.bin", &md5, content.len() as u64)]);
+        plan.max_threads = 1;
+        let report = apply_plan(&config, &plan, &ApplyOptions::default());
+        gate.join().expect("join probe gate");
+
+        assert!(report.results[0].ok, "{:?}", report.results[0].error);
+        assert_eq!(dir.read_text("install/data/big.bin"), content);
+        // 慢节点只被采样一次, 真正的下载走了快节点.
+        assert_eq!(slow.hits(&slow_path), 1);
+        assert_eq!(fast.hits(&fast_path), 2);
+    }
+
+    #[test]
+    fn disabling_the_probe_keeps_the_configured_order() {
+        let dir = TempDir::new("dl-probe-off");
+        let first = HttpServer::start();
+        let second = HttpServer::start();
+        let mut config = config_for(&dir);
+        config.cdns = vec![first.url("/cdnA"), second.url("/cdnB")];
+        let content = "y".repeat(256 * 1024);
+        let md5 = crate::update::md5_bytes(content.as_bytes());
+        let suffix = format!(
+            "{BRANCH}/Res/{}/{md5}.{}",
+            md5.chars().next().unwrap_or('0'),
+            content.len()
+        );
+        let first_path = format!("/cdnA/{suffix}");
+        let second_path = format!("/cdnB/{suffix}");
+        first.route(&first_path, &content);
+        second.route(&second_path, &content);
+
+        let mut plan = plan_of(vec![res_item("data/big.bin", &md5, content.len() as u64)]);
+        plan.max_threads = 1;
+        let report = apply_plan(
+            &config,
+            &plan,
+            &ApplyOptions {
+                probe_cdns: false,
+                ..Default::default()
+            },
+        );
+
+        assert!(report.results[0].ok, "{:?}", report.results[0].error);
+        assert_eq!(dir.read_text("install/data/big.bin"), content);
+        // 关闭测速后不发采样请求, 直接走配置里的第一个节点.
+        assert_eq!(first.hits(&first_path), 1);
+        assert_eq!(second.hits(&second_path), 0);
     }
 
     #[test]
