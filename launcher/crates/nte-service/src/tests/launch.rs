@@ -48,6 +48,7 @@ impl LaunchFixture {
         std::fs::create_dir_all(dir.join("home")).expect("create fake home");
         env.remove("WINEPREFIX");
         env.remove("PROTONPATH");
+        env.remove("WAYLAND_DISPLAY");
         env.remove("NTE_ROOT");
         env.remove("NTE_INSTALL");
         env.remove("STEAM_COMPAT_CLIENT_INSTALL_PATH");
@@ -204,10 +205,7 @@ fn launch_official_mode_sets_the_proton_environment() {
         .find_map(|line| line.strip_prefix("args: "))
         .expect("umu args");
     assert!(args.contains("NTEGame.exe"), "{args}");
-    assert!(
-        args.ends_with("/launcher /directly /softwareOpenGL"),
-        "{args}"
-    );
+    assert!(args.ends_with("/launcher /directly"), "{args}");
 
     // 官方启动器会被改成“随游戏退出”的薄壳
     let presence = std::fs::read_to_string(
@@ -269,7 +267,8 @@ fn managed_environment_launch_uses_its_prefix_proton_and_log_directory() {
 
 #[test]
 fn launch_background_mode_configures_the_native_session() {
-    let fixture = LaunchFixture::new("launch-background");
+    let mut fixture = LaunchFixture::new("launch-background");
+    fixture.env.set("WAYLAND_DISPLAY", "wayland-test");
     fixture.dir.write_text(
         "install/NTELauncher/UserData/Config/Config.ini",
         "[Setting]\nautoLogin=1\n",
@@ -287,6 +286,7 @@ fn launch_background_mode_configures_the_native_session() {
     assert_eq!(invocation.result.mode, "background");
     assert!(invocation.result.exe.ends_with("NTEGame.exe"));
     let dump = fixture.dump();
+    assert_eq!(env_value(&dump, "PROTON_ENABLE_WAYLAND"), Some("1"));
     assert_eq!(
         env_value(&dump, "NTE_BRIDGE_EXE"),
         Some(windows_path(&fixture.launcher.join("NTEGame.exe")).as_str())
@@ -297,7 +297,7 @@ fn launch_background_mode_configures_the_native_session() {
     );
     assert_eq!(
         env_value(&dump, "NTE_BRIDGE_ARGS"),
-        Some("/launcher /directly /softwareOpenGL")
+        Some("/launcher /directly")
     );
     assert!(env_value(&dump, "NTE_HELPER_LOG")
         .expect("helper log path")
@@ -584,7 +584,7 @@ fn global_launch_handoff_uses_global_client_for_official_and_background_modes() 
             );
         } else {
             assert!(
-                dump.contains("NTEGlobalGame.exe /launcher /directly /softwareOpenGL"),
+                dump.contains("NTEGlobalGame.exe /launcher /directly"),
                 "{dump}"
             );
         }

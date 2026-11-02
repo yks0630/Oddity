@@ -3,8 +3,17 @@ use std::process::Command;
 
 pub mod background;
 
-/// 官方 Qt 界面使用自带的软件渲染, 避免触发 Wine/Xwayland 的 GLX 故障.
-pub const OFFICIAL_ARGS: [&str; 3] = ["/launcher", "/directly", "/softwareOpenGL"];
+pub const OFFICIAL_ARGS: [&str; 2] = ["/launcher", "/directly"];
+
+/// 桌面 Wayland 使用原生驱动, Gamescope 使用它管理的 Xwayland.
+pub fn configure_display(command: &mut Command, wayland_available: bool, gamescope: bool) {
+    command.env_remove("PROTON_USE_WAYLAND");
+    if wayland_available && !gamescope {
+        command.env("PROTON_ENABLE_WAYLAND", "1");
+    } else {
+        command.env_remove("PROTON_ENABLE_WAYLAND");
+    }
+}
 
 /// UE map and extra args observed in NTEGame.log when the launcher starts the game.
 pub const GAME_ARGS: [&str; 2] = [
@@ -58,6 +67,27 @@ impl ProtonLaunch {
 mod tests {
     use super::*;
     use crate::testing::TempDir;
+
+    #[test]
+    fn display_backend_follows_the_desktop_and_gamescope() {
+        for (wayland, gamescope, expected) in [
+            (true, false, Some("1")),
+            (false, false, None),
+            (true, true, None),
+            (false, true, None),
+        ] {
+            let mut command = Command::new("umu-run");
+            command.env("PROTON_ENABLE_WAYLAND", "0");
+            command.env("PROTON_USE_WAYLAND", "1");
+            configure_display(&mut command, wayland, gamescope);
+            let value = |key: &str| command.get_envs().find(|(name, _)| *name == key).unwrap().1;
+            assert_eq!(
+                value("PROTON_ENABLE_WAYLAND"),
+                expected.map(std::ffi::OsStr::new)
+            );
+            assert_eq!(value("PROTON_USE_WAYLAND"), None);
+        }
+    }
 
     #[test]
     fn umu_launch_carries_prefix_and_game_args() {

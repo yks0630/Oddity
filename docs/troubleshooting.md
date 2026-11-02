@@ -106,7 +106,7 @@ Ubuntu 24.04 及更新版本可能通过 AppArmor 限制 user namespace. 优先�
 
 ### 官方启动器报 GLX BadAlloc 或导致 Xwayland 退出
 
-前台启动与后台启动均通过官方启动器的 `/softwareOpenGL` 参数启用其自带的软件渲染. 此参数只用于官方 Qt 界面, 游戏仍使用自身的图形渲染路径.
+Wayland 桌面下, Oddity 使用 Proton 的原生 Wayland 驱动启动官方组件及游戏. X11 会话与 Gamescope 使用 X11 驱动. 所选 Proton 需要支持原生 Wayland, 可使用 GE-Proton 11 系列.
 
 若仍出现 `GLXMakeCurrent BadAlloc`、`session helper exited before resource signal` 或 Xwayland 崩溃, 请导出启动日志, 并附上显卡驱动版本、Xwayland 版本和系统崩溃记录. Xwayland 退出可能连带关闭其他 X11 应用, 此时请先保留日志, 避免反复重试.
 

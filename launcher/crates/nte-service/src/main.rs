@@ -2038,8 +2038,12 @@ fn launch_impl_inner(
         .env("pgp_scale_value", "1")
         .env("UMU_LOG", "info")
         .env("PROTON_LOG", "0")
-        .env("PROTON_VERB", "run")
-        .env_remove("PROTON_ENABLE_WAYLAND");
+        .env("PROTON_VERB", "run");
+    nte_core::launch::configure_display(
+        &mut cmd,
+        std::env::var_os("WAYLAND_DISPLAY").is_some_and(|display| !display.is_empty()),
+        settings.game_mode.gamescope.enabled,
+    );
     for key in [
         "NTE_GAME_EXE",
         "NTE_GAME_CWD",
