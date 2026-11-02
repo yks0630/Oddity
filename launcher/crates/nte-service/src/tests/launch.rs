@@ -5,7 +5,10 @@ use std::time::Instant;
 
 #[test]
 fn gamescope_preserves_the_umu_handoff_and_environment() {
-    let fixture = LaunchFixture::new("gamescope-launch");
+    let mut fixture = LaunchFixture::new("gamescope-launch");
+    fixture.env.set("WAYLAND_DISPLAY", "wayland-test");
+    fixture.env.set("PROTON_ENABLE_WAYLAND", "1");
+    fixture.env.set("PROTON_USE_WAYLAND", "1");
     let options_log = fixture.dir.join("gamescope-args");
     write_script(&fixture.dir.join("bin"), "gamescope", &format!(
         "#!/bin/sh\nwhile [ \"$1\" != -- ]; do printf '%s\\n' \"$1\" >> '{}'; shift; done\nshift\nexec \"$@\"\n", options_log.display()
@@ -21,6 +24,8 @@ fn gamescope_preserves_the_umu_handoff_and_environment() {
     let invocation = launch_impl(&settings).unwrap();
     let dump = fixture.dump();
     assert!(dump.contains("HTGame.exe") && dump.contains("WINEPREFIX="));
+    assert_eq!(env_value(&dump, "PROTON_ENABLE_WAYLAND"), Some("0"));
+    assert_eq!(env_value(&dump, "PROTON_USE_WAYLAND"), Some("0"));
     let options = std::fs::read_to_string(options_log).unwrap();
     assert!(options.contains("-w\n1280\n-h\n720\n-r\n60\n"));
     fixture.stop(invocation);
@@ -192,8 +197,8 @@ fn launch_official_mode_sets_the_proton_environment() {
     assert_eq!(env_value(&dump, "UMU_LOG"), Some("info"));
     assert_eq!(env_value(&dump, "PROTON_LOG"), Some("0"));
     assert_eq!(env_value(&dump, "PROTON_VERB"), Some("run"));
-    // Proton 的 Wayland 开关必须被显式移除
-    assert!(env_value(&dump, "PROTON_ENABLE_WAYLAND").is_none());
+    assert_eq!(env_value(&dump, "PROTON_ENABLE_WAYLAND"), Some("0"));
+    assert_eq!(env_value(&dump, "PROTON_USE_WAYLAND"), Some("0"));
     assert_eq!(
         dump.lines()
             .find_map(|line| line.strip_prefix("cwd: "))
@@ -269,6 +274,8 @@ fn managed_environment_launch_uses_its_prefix_proton_and_log_directory() {
 fn launch_background_mode_configures_the_native_session() {
     let mut fixture = LaunchFixture::new("launch-background");
     fixture.env.set("WAYLAND_DISPLAY", "wayland-test");
+    fixture.env.set("PROTON_ENABLE_WAYLAND", "0");
+    fixture.env.set("PROTON_USE_WAYLAND", "0");
     fixture.dir.write_text(
         "install/NTELauncher/UserData/Config/Config.ini",
         "[Setting]\nautoLogin=1\n",
@@ -287,6 +294,7 @@ fn launch_background_mode_configures_the_native_session() {
     assert!(invocation.result.exe.ends_with("NTEGame.exe"));
     let dump = fixture.dump();
     assert_eq!(env_value(&dump, "PROTON_ENABLE_WAYLAND"), Some("1"));
+    assert_eq!(env_value(&dump, "PROTON_USE_WAYLAND"), Some("1"));
     assert_eq!(
         env_value(&dump, "NTE_BRIDGE_EXE"),
         Some(windows_path(&fixture.launcher.join("NTEGame.exe")).as_str())
