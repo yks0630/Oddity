@@ -83,6 +83,11 @@ export function gamepadViewport(target: HTMLElement) {
   return { top, bottom };
 }
 
+function modalLayer(element: HTMLElement) {
+  const value = Number(element.dataset.modalLayer ?? "");
+  return Number.isFinite(value) ? value : 0;
+}
+
 export function gamepadFeedback(effect: Feedback | "stop") {
   if (
     !gamepad.device ||
@@ -119,6 +124,7 @@ export function createGamepadNavigation() {
     [
       ...(navigationBar()?.querySelectorAll<HTMLElement>("button") ?? []),
     ].filter(visible);
+  // 多层弹窗按 BaseModal 登记的层号比较先后, 不依赖 Teleport 的 DOM 顺序.
   const modal = () =>
     document.querySelector<HTMLElement>(".pad-keyboard-backdrop") ??
     [
@@ -127,6 +133,7 @@ export function createGamepadNavigation() {
       ),
     ]
       .filter(visible)
+      .sort((a, b) => modalLayer(a) - modalLayer(b))
       .at(-1) ??
     null;
   const navigating = () =>

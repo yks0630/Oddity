@@ -1,6 +1,19 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onUpdated, ref, useId, watch } from "vue";
+import {
+  computed,
+  nextTick,
+  onBeforeUnmount,
+  onUpdated,
+  ref,
+  useId,
+  watch,
+} from "vue";
 import { useAnimate } from "motion-v";
+import {
+  isTopModalLayer,
+  popModalLayer,
+  pushModalLayer,
+} from "../core/modalLayers";
 import {
   useControlMotion,
   surfaceSpring,
@@ -22,6 +35,24 @@ const emit = defineEmits<{ "update:open": [value: boolean] }>();
 const titleId = useId();
 const panel = ref<HTMLElement | null>(null);
 const content = ref<HTMLElement | null>(null);
+// 弹窗层号决定叠放与焦点归属, 只有最上层的弹窗可以主动接管焦点.
+const layer = ref(0);
+let layerId = 0;
+const layerStyle = computed(() =>
+  layer.value ? { zIndex: `calc(var(--z-modal) + ${layer.value})` } : undefined,
+);
+function registerLayer() {
+  if (layerId) return;
+  const entry = pushModalLayer();
+  layerId = entry.id;
+  layer.value = entry.layer;
+}
+function releaseLayer() {
+  if (!layerId) return;
+  popModalLayer(layerId);
+  layerId = 0;
+  layer.value = 0;
+}
 let resizeObserver: ResizeObserver | undefined;
 let resizeAnimation: ReturnType<typeof animate> | undefined;
 let bodyHeight = 0;
@@ -142,6 +173,10 @@ function transition(element: Element, done: () => void, entering: boolean) {
 function enter(element: Element, done: () => void) {
   transition(element, done, true);
 }
+function afterLeave() {
+  // 快速关闭后重开会打断离场并触发 after-leave, 此时层号必须保留.
+  if (!props.open) releaseLayer();
+}
 function leave(element: Element, done: () => void) {
   const root = element as HTMLElement;
   root.inert = true;
@@ -162,9 +197,10 @@ watch(
   () => props.open,
   async (open) => {
     if (open) {
+      registerLayer();
       previous = document.activeElement as HTMLElement | null;
       await nextTick();
-      if (props.open)
+      if (props.open && isTopModalLayer(layer.value))
         panel.value?.querySelector<HTMLElement>("button")?.focus();
     } else {
       await nextTick();
@@ -178,12 +214,14 @@ onBeforeUnmount(() => {
   resizeObserver?.disconnect();
   resizeAnimation?.stop();
   restore();
+  releaseLayer();
 });
 // 切换表单或移除账号后, 将焦点留在弹窗内。
 onUpdated(() => {
   if (
     props.open &&
     panel.value &&
+    isTopModalLayer(layer.value) &&
     !panel.value.contains(document.activeElement)
   ) {
     panel.value.querySelector<HTMLElement>("button:not(:disabled)")?.focus();
@@ -231,6 +269,7 @@ function keydown(event: KeyboardEvent) {
       @leave="leave"
       @enter-cancelled="stopMotion"
       @leave-cancelled="stopMotion"
+      @after-leave="afterLeave"
     >
       <div
         v-if="open"
@@ -240,6 +279,8 @@ function keydown(event: KeyboardEvent) {
         :aria-labelledby="titleId"
         @keydown="keydown"
         :data-theme="theme"
+        :style="layerStyle"
+        :data-modal-layer="layer"
         :inert="!open"
         :aria-hidden="!open || undefined"
       >
