@@ -9,7 +9,10 @@ use crate::game::manifest::{
     parse_diff_list, parse_remote_config, parse_res_list, DiffManifest, GameManifest,
     LocalManifest, PakEntry, RemoteConfig, ResEntry,
 };
-use crate::game::plan::Throughput;
+use crate::game::plan::{
+    balance_plan_choices, chain_upper_bound_nanos, patch_edge_nanos, Throughput,
+    PLAN_PROCESSING_LANES_DEFAULT,
+};
 use crate::game::pxml;
 use crate::http::HttpClient;
 use crate::update::{md5_bytes, md5_file_cancellable};
@@ -248,7 +251,7 @@ pub fn check_cancellable(
 }
 
 /// 与 check_cancellable 相同，但允许带上吞吐估计，
-/// 由预计完成时间决定是否保留补丁链。
+/// 由预计完成时间决定选补丁链还是整包。
 pub fn check_cancellable_with_estimates(
     config: &GameUpdateConfig,
     opts: CheckOptions,
@@ -533,9 +536,19 @@ pub fn check_bundle_cancellable_with_estimates(
         });
     }
 
-    attach_patches(&mut plan, config, bundle, &map);
-    apply_throughput_choices(&mut plan, throughput);
+    attach_patches(&mut plan, config, bundle, &map, throughput);
     plan.items.sort_by(|a, b| a.path.cmp(&b.path));
+    if let Some(throughput) = throughput {
+        // 逐项选链只比较单个文件；多文件同时更新时下载并行、补丁处理串行，
+        // 整份计划的完工时间可能由处理侧决定，这里按整体 makespan 再平衡一次。
+        // 补丁应用和校验共用一条处理通道; 整包校验占用各自的下载 worker.
+        balance_plan_choices(
+            &mut plan.items,
+            throughput,
+            PLAN_PROCESSING_LANES_DEFAULT,
+            plan.max_threads.max(1),
+        );
+    }
     plan.unverified.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(plan)
 }
@@ -545,6 +558,7 @@ fn attach_patches(
     config: &GameUpdateConfig,
     bundle: &RemoteBundle,
     map: &BTreeMap<String, LocalInfo>,
+    throughput: Option<&Throughput>,
 ) {
     let Some(diff) = bundle.diff.as_ref() else {
         return;
@@ -565,8 +579,7 @@ fn attach_patches(
         }
         let old_id = format!("{}.{}", info.md5.to_ascii_lowercase(), info.size);
         let new_id = format!("{}.{}", item.md5.to_ascii_lowercase(), item.size);
-        let Some(chain) = best_patch_chain(diff, &old_id, &new_id, &bundle.config.hash, item.size)
-        else {
+        let Some(chain) = best_patch_chain(diff, &old_id, &new_id, item.size, throughput) else {
             continue;
         };
         item.download_size = chain.iter().map(|patch| patch.size).sum();
@@ -574,54 +587,46 @@ fn attach_patches(
     }
 }
 
-/// 用吞吐估计否决预计比整包更慢的补丁链。
-///
-/// 这里只决定是否保留已经选出的最小字节链，不重新选链；跳数上限、
-/// 最后一跳版本等约束仍由 best_patch_chain 保证。
-fn apply_throughput_choices(plan: &mut UpdatePlan, throughput: Option<&Throughput>) {
-    let Some(throughput) = throughput else {
-        return;
-    };
-    for item in &mut plan.items {
-        if item.patches.is_empty() || crate::game::plan::should_use_patch(item, throughput) {
-            continue;
-        }
-        item.patches.clear();
-        item.download_size = item.size;
-    }
-}
-
 const MAX_CHAIN_STEPS: u32 = 8;
 
 struct DiffEdge {
     old_file: String,
+    old_md5: String,
+    old_size: u64,
     new_file: String,
+    new_md5: String,
     patch_md5: String,
     patch_size: u64,
-    version: String,
+    new_size: u64,
 }
 
-/// 在 lastdiff 反向图上找总补丁体积最小的链。
+/// 在 lastdiff 反向图上选链。
 ///
-/// 官方允许跨多个历史版本拼接补丁，但最后一步必须落到当前构建（v 与
-/// config.Hash 一致）；中间步骤可以是更早版本的补丁。返回的链已经按
-/// 应用顺序排列，并且总大小严格小于整文件下载。
+/// 传入吞吐估计时，边权是该跳的预计耗时（补丁下载 + 输出内容应用 + 每跳
+/// 固定开销，纳秒），返回预计时间最短的链. 剪枝上界按整包完成时间的
+/// 切换余量计算; 没有估计时按总补丁体积选链. 两种模式都只接受补丁总字节
+/// 严格小于整包的链，跳数不超过 MAX_CHAIN_STEPS。
+///
+/// 链中每一跳（包括最后一跳）都只要求内容 id 匹配：v 只标识该行 newfile
+/// 所属的构建，不影响补丁可用性。newfile 是内容寻址 id，反向搜索从目标内容
+/// 出发，最后一跳必然产出目标内容；应用后仍有整文件 MD5 校验兜底。返回的
+/// 链已经按应用顺序排列。
 fn best_patch_chain(
     diff: &DiffManifest,
     old_id: &str,
     new_id: &str,
-    remote_hash: &str,
     full_size: u64,
+    throughput: Option<&Throughput>,
 ) -> Option<Vec<PatchRef>> {
     if old_id == new_id {
         return None;
     }
     let mut edges = Vec::new();
     for patch in &diff.patches {
-        let Some(old_file) = normalize_content_id(&patch.old_file) else {
+        let Some((old_md5, old_size)) = split_content_id(&patch.old_file) else {
             continue;
         };
-        let Some(new_file) = normalize_content_id(&patch.new_file) else {
+        let Some((new_md5, new_size)) = split_content_id(&patch.new_file) else {
             continue;
         };
         let Some((patch_md5, patch_size)) = split_content_id(&patch.patch) else {
@@ -631,11 +636,14 @@ fn best_patch_chain(
             continue;
         }
         edges.push(DiffEdge {
-            old_file,
-            new_file,
+            old_file: format!("{old_md5}.{old_size}"),
+            old_md5,
+            old_size,
+            new_file: format!("{new_md5}.{new_size}"),
+            new_md5,
             patch_md5,
             patch_size,
-            version: patch.version.clone(),
+            new_size,
         });
     }
 
@@ -644,91 +652,100 @@ fn best_patch_chain(
         incoming.entry(&edge.new_file).or_default().push(index);
     }
 
-    // 从目标内容反向搜索：每条边的代价是该补丁的下载大小。
-    let mut best: HashMap<String, (u64, u32)> = HashMap::new();
-    let mut parent: HashMap<String, (String, usize)> = HashMap::new();
-    let mut heap = BinaryHeap::new();
-    best.insert(new_id.to_string(), (0, 0));
-    heap.push(Reverse((0u64, 0u32, new_id.to_string())));
+    let time_bound = throughput.map(|throughput| chain_upper_bound_nanos(full_size, throughput));
 
-    let mut found = false;
-    while let Some(Reverse((cost, steps, node))) = heap.pop() {
-        if best
-            .get(&node)
-            .is_some_and(|&(known_cost, known_steps)| (known_cost, known_steps) < (cost, steps))
-        {
+    struct Label {
+        cost: u64,
+        steps: u32,
+        bytes: u64,
+        next: Option<(usize, usize)>,
+    }
+    // 同一内容可能有更快但更大或更多跳的后缀, 只有三个维度都不差才能淘汰.
+    let mut labels = vec![Label {
+        cost: 0,
+        steps: 0,
+        bytes: 0,
+        next: None,
+    }];
+    let mut best: HashMap<&str, Vec<usize>> = HashMap::from([(new_id, vec![0])]);
+    let mut heap = BinaryHeap::from([Reverse((0u64, 0u32, 0u64, new_id, 0usize))]);
+    let mut found = None;
+    while let Some(Reverse((cost, steps, patch_bytes, node, label_index))) = heap.pop() {
+        if !best[node].contains(&label_index) {
             continue;
         }
         if node == old_id {
-            found = true;
+            found = Some(label_index);
             break;
         }
         if steps >= MAX_CHAIN_STEPS {
             continue;
         }
-        let Some(indices) = incoming.get(node.as_str()) else {
+        let Some(indices) = incoming.get(node) else {
             continue;
         };
         for &index in indices {
             let edge = &edges[index];
-            // 只有链的最后一跳需要匹配当前构建；中间跳允许来自历史版本。
-            if node == new_id
-                && !edge.version.is_empty()
-                && !remote_hash.is_empty()
-                && !edge.version.eq_ignore_ascii_case(remote_hash)
-            {
+            let next_bytes = patch_bytes.saturating_add(edge.patch_size);
+            if next_bytes >= full_size {
                 continue;
             }
-            let next_cost = cost.saturating_add(edge.patch_size);
-            if next_cost >= full_size {
+            let weight = match throughput {
+                Some(throughput) => patch_edge_nanos(edge.patch_size, edge.new_size, throughput),
+                None => edge.patch_size,
+            };
+            let next_cost = cost.saturating_add(weight);
+            if time_bound.is_some_and(|bound| next_cost > bound) {
                 continue;
             }
             let next_steps = steps + 1;
-            let better = match best.get(&edge.old_file) {
-                None => true,
-                Some(&(known_cost, known_steps)) => {
-                    (next_cost, next_steps) < (known_cost, known_steps)
-                }
-            };
-            if !better {
+            let frontier = best.entry(edge.old_file.as_str()).or_default();
+            if frontier.iter().any(|&id| {
+                let known = &labels[id];
+                known.cost <= next_cost && known.steps <= next_steps && known.bytes <= next_bytes
+            }) {
                 continue;
             }
-            best.insert(edge.old_file.clone(), (next_cost, next_steps));
-            parent.insert(edge.old_file.clone(), (node.clone(), index));
-            heap.push(Reverse((next_cost, next_steps, edge.old_file.clone())));
+            frontier.retain(|&id| {
+                let known = &labels[id];
+                !(next_cost <= known.cost && next_steps <= known.steps && next_bytes <= known.bytes)
+            });
+            let id = labels.len();
+            labels.push(Label {
+                cost: next_cost,
+                steps: next_steps,
+                bytes: next_bytes,
+                next: Some((label_index, index)),
+            });
+            frontier.push(id);
+            heap.push(Reverse((
+                next_cost,
+                next_steps,
+                next_bytes,
+                edge.old_file.as_str(),
+                id,
+            )));
         }
     }
-    if !found {
-        return None;
-    }
-
+    let mut current = found?;
     let mut order = Vec::new();
-    let mut current = old_id.to_string();
-    while current != new_id {
-        let (next, index) = parent.get(&current)?;
-        order.push(*index);
-        current = next.clone();
+    while let Some((next, index)) = labels[current].next {
+        order.push(index);
+        current = next;
     }
     let mut chain = Vec::with_capacity(order.len());
     for index in order {
         let edge = &edges[index];
-        let (old_md5, old_size) = split_content_id(&edge.old_file)?;
-        let (new_md5, new_size) = split_content_id(&edge.new_file)?;
         chain.push(PatchRef {
             md5: edge.patch_md5.clone(),
             size: edge.patch_size,
-            old_md5,
-            old_size,
-            new_md5,
-            new_size,
+            old_md5: edge.old_md5.clone(),
+            old_size: edge.old_size,
+            new_md5: edge.new_md5.clone(),
+            new_size: edge.new_size,
         });
     }
     Some(chain)
-}
-
-fn normalize_content_id(value: &str) -> Option<String> {
-    let (md5, size) = split_content_id(value)?;
-    Some(format!("{md5}.{size}"))
 }
 
 fn split_content_id(value: &str) -> Option<(String, u64)> {
@@ -1345,7 +1362,8 @@ mod tests {
         assert_eq!(plan.total_bytes(), 50);
         assert_eq!(plan.required_disk_bytes(), 250);
 
-        // 补丁版本号与远端 hash 不符则不使用
+        // 最后一跳来自旧构建（v 与远端 hash 不同）时仍然使用补丁：
+        // newfile 是内容寻址 id，补丁输出就是目标内容，最终整文件 MD5 兜底。
         let plan = check_bundle(
             &config,
             &bundle(
@@ -1355,9 +1373,10 @@ mod tests {
             CheckOptions::default(),
         )
         .expect("check");
-        assert!(plan.items[0].patches.is_empty());
-        assert_eq!(plan.items[0].download_size, 200);
-        assert_eq!(plan.required_disk_bytes(), 200);
+        assert_eq!(plan.items[0].patches.len(), 1);
+        assert_eq!(plan.items[0].patches[0].md5, patch_md5);
+        assert_eq!(plan.items[0].download_size, 50);
+        assert_eq!(plan.required_disk_bytes(), 250);
 
         // 补丁体积不小于整包时直接下载整包
         let plan = check_bundle(
@@ -1482,6 +1501,135 @@ mod tests {
     }
 
     #[test]
+    fn time_weighted_chain_prefers_fewer_hops_when_apply_is_slow() {
+        let dir = TempDir::new("check-time-chain");
+        let config = config_for(&dir);
+        let old_md5 = "aa".repeat(16);
+        let mid_md5 = "11".repeat(16);
+        let new_md5 = "22".repeat(16);
+        // 本地 500 MB 旧文件、目标 1 GB；用稀疏文件避免真实占用磁盘。
+        sparse(&dir.join("install/data/a.bin"), 500_000_000);
+        write_ledger(
+            &config,
+            &format!(
+                "<ResList version=\"1.4.16\" tag=\"baseTag\"><Res filename=\"data/a.bin\" md5=\"{old_md5}\" filesize=\"500000000\"/></ResList>"
+            ),
+        );
+        let old_id = format!("{old_md5}.500000000");
+        let mid_id = format!("{mid_md5}.1000000000");
+        let new_id = format!("{new_md5}.1000000000");
+        let edge = |old: &str, new: &str, patch: &str| PatchEntry {
+            old_file: old.to_string(),
+            new_file: new.to_string(),
+            patch: patch.to_string(),
+            version: String::new(),
+            blocks: Vec::new(),
+        };
+        let diff = DiffManifest {
+            sections: Vec::new(),
+            patches: vec![
+                // 直连：100 MB 补丁，1 跳。
+                edge(&old_id, &new_id, &format!("{}.100000000", "cc".repeat(16))),
+                // 两跳：各 10 MB，但要多写一次 1 GB 中间内容。
+                edge(&old_id, &mid_id, &format!("{}.10000000", "33".repeat(16))),
+                edge(&mid_id, &new_id, &format!("{}.10000000", "44".repeat(16))),
+            ],
+        };
+        let remote = manifest_res(vec![res("data/a.bin", &new_md5, 1_000_000_000)]);
+        let bundle = bundle(remote, Some(diff));
+
+        // 无吞吐估计：保持按字节选链，2 跳共 20 MB 更省。
+        let plan = check_bundle(&config, &bundle, CheckOptions::default()).expect("check");
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].patches.len(), 2);
+        assert_eq!(plan.items[0].download_size, 20_000_000);
+
+        // 中速下载 + 慢速应用：直连 100 MB 补丁约 12.05s，2 跳约 20.5s，选直连；
+        // 该速率下整包仍比补丁链慢，规划级平衡不会改判。
+        let throughput = Throughput {
+            download_bytes_per_second: 50_000_000.0,
+            apply_bytes_per_second: 100_000_000.0,
+            verify_bytes_per_second: 365_000_000.0,
+        };
+        let plan = check_bundle_with_estimates(
+            &config,
+            &bundle,
+            CheckOptions::default(),
+            Some(&throughput),
+            &|| false,
+        )
+        .expect("check");
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].patches.len(), 1);
+        assert_eq!(plan.items[0].download_size, 100_000_000);
+        assert_eq!(plan.total_bytes(), 100_000_000);
+    }
+
+    #[test]
+    fn plan_level_estimate_switches_items_when_processing_is_the_bottleneck() {
+        let dir = TempDir::new("check-plan-balance");
+        let config = config_for(&dir);
+        let mut diff = DiffManifest {
+            sections: Vec::new(),
+            patches: Vec::new(),
+        };
+        let mut remote = Vec::new();
+        let mut ledger = String::from("<ResList version=\"1.4.16\" tag=\"baseTag\">");
+        for (index, name) in ["data/a.bin", "data/b.bin"].iter().enumerate() {
+            let old_content = vec![b'o'; 100];
+            let new_content = vec![b'n'; 200];
+            dir.write(format!("install/{name}"), &old_content);
+            let old_md5 = crate::update::md5_bytes(&old_content);
+            let new_md5 = crate::update::md5_bytes(&new_content);
+            ledger.push_str(&format!(
+                "<Res filename=\"{name}\" md5=\"{old_md5}\" filesize=\"100\"/>"
+            ));
+            remote.push(res(name, &new_md5, 200_000_000));
+            diff.patches.push(PatchEntry {
+                old_file: format!("{old_md5}.100"),
+                new_file: format!("{new_md5}.200000000"),
+                patch: format!("{}.50000000", ["ab".repeat(16), "cd".repeat(16)][index]),
+                version: String::new(),
+                blocks: Vec::new(),
+            });
+        }
+        ledger.push_str("</ResList>");
+        write_ledger(&config, &ledger);
+        let bundle = bundle(manifest_res(remote), Some(diff));
+
+        // 默认估计（8 MB/s）下下载仍是瓶颈，逐项时间选链的结果保持不变。
+        let plan = check_bundle_with_estimates(
+            &config,
+            &bundle,
+            CheckOptions::default(),
+            Some(&Throughput::default()),
+            &|| false,
+        )
+        .expect("check");
+        assert_eq!(plan.items.len(), 2);
+        assert!(plan.items.iter().all(|item| item.patches.len() == 1));
+        assert_eq!(plan.total_bytes(), 100_000_000);
+
+        // 极快下载 + 极慢应用：整份计划被串行处理拖住，至少一项改走整包。
+        let serial_bottleneck = Throughput {
+            download_bytes_per_second: 1_000_000_000.0,
+            apply_bytes_per_second: 200_000_000.0,
+            verify_bytes_per_second: 365_000_000.0,
+        };
+        let plan = check_bundle_with_estimates(
+            &config,
+            &bundle,
+            CheckOptions::default(),
+            Some(&serial_bottleneck),
+            &|| false,
+        )
+        .expect("check");
+        assert_eq!(plan.items.len(), 2);
+        assert!(plan.items.iter().any(|item| item.patches.is_empty()));
+        assert!(plan.total_bytes() > 100_000_000);
+    }
+
+    #[test]
     fn chooses_the_cheapest_multi_step_patch_chain() {
         let dir = TempDir::new("check-patch-chain");
         let config = config_for(&dir);
@@ -1560,7 +1708,34 @@ mod tests {
         assert_eq!(plan.items[0].download_size, 50);
         assert_eq!(plan.items[0].patches[0].md5, "ee".repeat(16));
 
-        // 最后一跳必须是当前构建；中间跳可以是历史版本
+        // 同一 (old, new) 的多条边来自不同构建时，最后一跳的 v 不参与过滤，
+        // 仍按补丁体积取最小的一条。
+        let plan = check_bundle(
+            &config,
+            &bundle(
+                remote.clone(),
+                Some(DiffManifest {
+                    sections: Vec::new(),
+                    patches: vec![
+                        edge(&old_id, &new_id, &format!("{}.80", "dd".repeat(16)), "OLD"),
+                        edge(
+                            &old_id,
+                            &new_id,
+                            &format!("{}.50", "ee".repeat(16)),
+                            "OTHER",
+                        ),
+                    ],
+                }),
+            ),
+            CheckOptions::default(),
+        )
+        .expect("check");
+        assert_eq!(plan.items[0].patches.len(), 1);
+        assert_eq!(plan.items[0].download_size, 50);
+        assert_eq!(plan.items[0].patches[0].md5, "ee".repeat(16));
+
+        // 旧构建补丁的 newfile 匹配目标内容时即可使用,
+        // 因此这里选 2 跳 70 字节链，而不是 100 字节直连。
         let plan = check_bundle(
             &config,
             &bundle(
@@ -1587,8 +1762,10 @@ mod tests {
             CheckOptions::default(),
         )
         .expect("check");
-        assert!(plan.items[0].patches.is_empty());
-        assert_eq!(plan.items[0].download_size, 300);
+        assert_eq!(plan.items[0].patches.len(), 2);
+        assert_eq!(plan.items[0].download_size, 70);
+        assert_eq!(plan.items[0].patches[0].md5, "aa".repeat(16));
+        assert_eq!(plan.items[0].patches[1].md5, "bb".repeat(16));
 
         // 链的总体积不小于整包时直接下载整包
         let plan = check_bundle(
@@ -1962,5 +2139,78 @@ mod tests {
             assert_eq!(ledger.res[0].filesize, 7);
             assert_eq!(ledger.res[0].md5, md5);
         }
+    }
+    #[test]
+    fn chain_search_keeps_the_smaller_suffix_when_the_faster_one_exceeds_the_byte_limit() {
+        let id = |tag: u8| format!("{tag:032x}.1000");
+        let (old, mid, via, new) = (id(1), id(2), id(3), id(4));
+        let edge = |old: &str, new: &str, size| PatchEntry {
+            old_file: old.into(),
+            new_file: new.into(),
+            patch: format!("{:032x}.{size}", 5),
+            ..Default::default()
+        };
+        let diff = DiffManifest {
+            patches: vec![
+                edge(&old, &mid, 200),
+                edge(&mid, &new, 850),
+                edge(&mid, &via, 50),
+                edge(&via, &new, 50),
+            ],
+            ..Default::default()
+        };
+        let throughput = Throughput {
+            download_bytes_per_second: 1000.0,
+            apply_bytes_per_second: 1000.0,
+            verify_bytes_per_second: 50.0,
+        };
+        // 直达后缀更快, 但前接 200 字节会超过整包; 两跳后缀仍然可用.
+        let chain =
+            best_patch_chain(&diff, &old, &new, 1000, Some(&throughput)).expect("feasible chain");
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain.iter().map(|patch| patch.size).sum::<u64>(), 300);
+    }
+
+    #[test]
+    fn chain_search_keeps_the_shorter_suffix_at_the_hop_limit() {
+        let ids: Vec<_> = (0..10).map(|tag| format!("{tag:032x}.1000")).collect();
+        let edge = |old: usize, new: usize, size| PatchEntry {
+            old_file: ids[old].clone(),
+            new_file: ids[new].clone(),
+            patch: format!("{:032x}.{size}", 20),
+            ..Default::default()
+        };
+        let mut patches: Vec<_> = (1..9).map(|index| edge(index, index + 1, 1)).collect();
+        patches.extend([edge(0, 1, 1), edge(1, 9, 20)]);
+        let diff = DiffManifest {
+            patches,
+            ..Default::default()
+        };
+        // 8 跳的便宜后缀无法再前接一跳, 不能淘汰 1 跳后缀.
+        let chain = best_patch_chain(&diff, &ids[0], &ids[9], 1000, None).expect("two-hop chain");
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain.iter().map(|patch| patch.size).sum::<u64>(), 21);
+    }
+
+    #[test]
+    fn chain_budget_uses_the_same_verification_margin_as_the_item_policy() {
+        let old = format!("{}.500", "aa".repeat(16));
+        let new = format!("{}.1000", "bb".repeat(16));
+        let diff = DiffManifest {
+            patches: vec![PatchEntry {
+                old_file: old.clone(),
+                new_file: new.clone(),
+                patch: format!("{}.100", "cc".repeat(16)),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let throughput = Throughput {
+            download_bytes_per_second: 1000.0,
+            apply_bytes_per_second: 400.0,
+            verify_bytes_per_second: 100.0,
+        };
+        // 边成本 2.65s, 整包下载的余量仅 2.1s; 整包含校验的政策上界允许到 3.1s.
+        assert!(best_patch_chain(&diff, &old, &new, 1000, Some(&throughput)).is_some());
     }
 }
