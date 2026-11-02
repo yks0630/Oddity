@@ -4,6 +4,7 @@
 
 ## 先看这些
 
+- 第一次参与贡献，先看[贡献者入门](https://github.com/LaT-SKY/Oddity/discussions/156)：项目结构、本地开发、第一个 PR 的流程。
 - 使用与安装问题请移步至 [README](README.md)、[安装指南](docs/install.md) 和 [排障指南](docs/troubleshooting.md)。
 - 安全漏洞不要提交公开 Issue，请按 [安全政策](SECURITY.md) 私下报告。
 - 提交代码前，先在本地完成格式、测试和构建检查。
