@@ -3,6 +3,9 @@ use std::process::Command;
 
 pub mod background;
 
+/// 官方 Qt 界面使用自带的软件渲染, 避免触发 Wine/Xwayland 的 GLX 故障.
+pub const OFFICIAL_ARGS: [&str; 3] = ["/launcher", "/directly", "/softwareOpenGL"];
+
 /// UE map and extra args observed in NTEGame.log when the launcher starts the game.
 pub const GAME_ARGS: [&str; 2] = [
     "/Game/LoginAndCreate/Map/Updater/Updater_P",

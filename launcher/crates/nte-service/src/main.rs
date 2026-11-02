@@ -1923,7 +1923,7 @@ fn launch_impl_inner(
             (
                 "official".to_string(),
                 exe.clone(),
-                vec!["/launcher".to_string(), "/directly".to_string()],
+                nte_core::launch::OFFICIAL_ARGS.map(String::from).to_vec(),
                 exe,
                 None,
                 None,
@@ -2074,7 +2074,7 @@ fn launch_impl_inner(
         // 由官方正常启动按钮完成资源、登录和管道交接.
         cmd.env("NTE_BRIDGE_EXE", win_exe)
             .env("NTE_BRIDGE_CWD", win_cwd)
-            .env("NTE_BRIDGE_ARGS", "/launcher /directly")
+            .env("NTE_BRIDGE_ARGS", nte_core::launch::OFFICIAL_ARGS.join(" "))
             .env(
                 "NTE_HELPER_LOG",
                 windows_path(&log_dir.join("helper-window.log")),

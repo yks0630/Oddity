@@ -204,7 +204,10 @@ fn launch_official_mode_sets_the_proton_environment() {
         .find_map(|line| line.strip_prefix("args: "))
         .expect("umu args");
     assert!(args.contains("NTEGame.exe"), "{args}");
-    assert!(args.ends_with("/launcher /directly"), "{args}");
+    assert!(
+        args.ends_with("/launcher /directly /softwareOpenGL"),
+        "{args}"
+    );
 
     // 官方启动器会被改成“随游戏退出”的薄壳
     let presence = std::fs::read_to_string(
@@ -294,7 +297,7 @@ fn launch_background_mode_configures_the_native_session() {
     );
     assert_eq!(
         env_value(&dump, "NTE_BRIDGE_ARGS"),
-        Some("/launcher /directly")
+        Some("/launcher /directly /softwareOpenGL")
     );
     assert!(env_value(&dump, "NTE_HELPER_LOG")
         .expect("helper log path")
@@ -581,7 +584,7 @@ fn global_launch_handoff_uses_global_client_for_official_and_background_modes() 
             );
         } else {
             assert!(
-                dump.contains("NTEGlobalGame.exe /launcher /directly"),
+                dump.contains("NTEGlobalGame.exe /launcher /directly /softwareOpenGL"),
                 "{dump}"
             );
         }
