@@ -9,6 +9,7 @@ use serde::Serialize;
 use nte_core::config::LauncherConfig;
 use nte_core::game::check::CheckOptions;
 use nte_core::game::download::ApplyOptions;
+use nte_core::game::plan::{StageTimings, Throughput};
 use nte_core::throttle::RateLimiter;
 use nte_core::{disk, game, install, update, updates};
 
@@ -89,6 +90,8 @@ pub(crate) struct DownloadInner {
     pub(crate) status: DownloadStatus,
     cancel: Option<Arc<AtomicBool>>,
     last_progress: Option<Instant>,
+    /// 最近一次成功应用任务的实测吞吐, 含 app_id, 用于下次检查估算完成时间.
+    throughput: Option<(String, Throughput)>,
 }
 
 #[derive(Default)]
@@ -152,6 +155,40 @@ fn publish_cancelled(app: &ServiceHandle) {
     });
 }
 
+/// 当前游戏可用的吞吐估计; 没有历史样本时退回到该游戏的默认值。
+fn current_throughput(current: Option<&(String, Throughput)>, app_id: &str) -> Throughput {
+    match current {
+        Some((id, throughput)) if id == app_id => *throughput,
+        _ => Throughput::for_app_id(app_id),
+    }
+}
+
+/// 用本次任务的实测耗时校准估计; 切换游戏时从新游戏的默认值重新累积。
+fn next_throughput(
+    current: Option<&(String, Throughput)>,
+    app_id: &str,
+    timings: &StageTimings,
+) -> Option<(String, Throughput)> {
+    if timings.is_empty() {
+        // 没有有效样本时保留已有估计, 不用默认值覆盖已校准的结果。
+        return current.cloned();
+    }
+    let mut throughput = current_throughput(current, app_id);
+    throughput.observe(timings);
+    Some((app_id.to_string(), throughput))
+}
+
+/// 规划按用户限速封顶下载速度; 限速为 0 表示不限速, 保持原估计。
+fn cap_download_throughput(mut throughput: Throughput, limit_bytes_per_second: u64) -> Throughput {
+    if limit_bytes_per_second > 0 {
+        throughput.download_bytes_per_second = throughput
+            .download_bytes_per_second
+            .min(limit_bytes_per_second as f64)
+            .max(1.0);
+    }
+    throughput
+}
+
 fn check_game(
     app: &ServiceHandle,
     settings: &Settings,
@@ -163,12 +200,22 @@ fn check_game(
         LauncherConfig::load(root).map_err(|error| format!("读取启动器配置失败: {error}"))?;
     let game_config = game::GameUpdateConfig::load(root, config.game_id)
         .map_err(|error| format!("读取游戏资源配置失败: {error}"))?;
-    let plan = game::check::check_cancellable(
+    // 锁只用于复制估计, 资源检查可能持续数秒, 不能持锁等待。
+    let throughput = app
+        .downloads
+        .inner
+        .lock()
+        .map(|inner| current_throughput(inner.throughput.as_ref(), &game_config.app_id))
+        .unwrap_or_else(|_| Throughput::for_app_id(&game_config.app_id));
+    // 限速会拖长实际下载, 规划必须按受限后的速度估算, 否则可能误判整包更快。
+    let throughput = cap_download_throughput(throughput, settings.updates.limit_bytes_per_second);
+    let plan = game::check::check_cancellable_with_estimates(
         &game_config,
         CheckOptions {
             full,
             include_optional: false,
         },
+        Some(&throughput),
         &|| cancel.load(Ordering::Relaxed),
     )
     .map_err(|error| format!("检查游戏资源失败: {error}"))?;
@@ -454,6 +501,18 @@ fn run_plan(
         &mut on_result,
         &|| cancel.load(Ordering::Relaxed),
     );
+    // 取消或失败的任务样本不完整, 只在校验与安装都完成时校准。
+    if !report.cancelled && report.failed == 0 && report.ledger_error.is_none() {
+        // 锁只覆盖估计更新, 不跨后续发布与错误判断。
+        if let Ok(mut inner) = app.downloads.inner.lock() {
+            let next = next_throughput(
+                inner.throughput.as_ref(),
+                &game_config.app_id,
+                &report.timings,
+            );
+            inner.throughput = next;
+        }
+    }
     if report.cancelled {
         publish_cancelled(app);
         return Ok(());
@@ -665,3 +724,103 @@ pub fn game_download_cancel(manager: &DownloadManager) -> DownloadStatus {
 #[cfg(test)]
 #[path = "tests/download.rs"]
 mod tests;
+
+#[cfg(test)]
+mod throughput_tests {
+    use super::*;
+
+    fn download_sample(bytes: u64, nanos: u64) -> StageTimings {
+        StageTimings {
+            download_bytes: bytes,
+            download_nanos: nanos,
+            ..StageTimings::default()
+        }
+    }
+
+    fn custom_throughput(download: f64) -> Throughput {
+        Throughput {
+            download_bytes_per_second: download,
+            apply_bytes_per_second: 2.0,
+            verify_bytes_per_second: 3.0,
+        }
+    }
+
+    #[test]
+    fn next_throughput_calibrates_same_app_id() {
+        let current = ("1289".to_string(), custom_throughput(1_000.0));
+        // 2 秒下载 40 MB, 速率远高于旧估计, 应明显上调。
+        let (app_id, throughput) = next_throughput(
+            Some(&current),
+            "1289",
+            &download_sample(40_000_000, 2_000_000_000),
+        )
+        .unwrap();
+        assert_eq!(app_id, "1289");
+        let expected = 0.3 * 20_000_000.0 + 0.7 * 1_000.0;
+        assert!((throughput.download_bytes_per_second - expected).abs() < 1.0);
+        // 样本里没有应用与校验数据, 这两项保持原值。
+        assert_eq!(throughput.apply_bytes_per_second, 2.0);
+        assert_eq!(throughput.verify_bytes_per_second, 3.0);
+    }
+
+    #[test]
+    fn next_throughput_resets_for_different_app_id() {
+        let current = ("1289".to_string(), custom_throughput(100_000_000.0));
+        let sample = download_sample(40_000_000, 2_000_000_000);
+        let (app_id, throughput) = next_throughput(Some(&current), "3000001", &sample).unwrap();
+        assert_eq!(app_id, "3000001");
+        // 切换游戏后从国际服默认值重新累积, 不沿用旧游戏的估计。
+        let mut expected = Throughput::for_app_id("3000001");
+        expected.observe(&sample);
+        assert_eq!(throughput, expected);
+    }
+
+    #[test]
+    fn next_throughput_keeps_estimate_without_samples() {
+        let current = ("1289".to_string(), custom_throughput(1_000.0));
+        assert_eq!(
+            next_throughput(Some(&current), "1289", &StageTimings::default()),
+            Some(current.clone())
+        );
+        assert_eq!(
+            next_throughput(None, "1289", &StageTimings::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn current_throughput_uses_matching_estimate_or_default() {
+        let current = ("3000001".to_string(), custom_throughput(1_000.0));
+        assert_eq!(current_throughput(Some(&current), "3000001"), current.1);
+        assert_eq!(
+            current_throughput(Some(&current), "1289"),
+            Throughput::for_app_id("1289")
+        );
+        assert_eq!(
+            current_throughput(None, "1289"),
+            Throughput::for_app_id("1289")
+        );
+    }
+
+    #[test]
+    fn cap_download_throughput_keeps_estimate_without_limit() {
+        let throughput = custom_throughput(50_000_000.0);
+        assert_eq!(cap_download_throughput(throughput, 0), throughput);
+    }
+
+    #[test]
+    fn cap_download_throughput_clamps_to_user_limit() {
+        let throughput = custom_throughput(50_000_000.0);
+        let capped = cap_download_throughput(throughput, 2_000_000);
+        assert_eq!(capped.download_bytes_per_second, 2_000_000.0);
+        // 应用与校验吞吐不受下载限速影响。
+        assert_eq!(
+            capped.apply_bytes_per_second,
+            throughput.apply_bytes_per_second
+        );
+        assert_eq!(
+            capped.verify_bytes_per_second,
+            throughput.verify_bytes_per_second
+        );
+    }
+}

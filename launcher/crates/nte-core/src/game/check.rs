@@ -9,6 +9,7 @@ use crate::game::manifest::{
     parse_diff_list, parse_remote_config, parse_res_list, DiffManifest, GameManifest,
     LocalManifest, PakEntry, RemoteConfig, ResEntry,
 };
+use crate::game::plan::Throughput;
 use crate::game::pxml;
 use crate::http::HttpClient;
 use crate::update::{md5_bytes, md5_file_cancellable};
@@ -243,11 +244,22 @@ pub fn check_cancellable(
     opts: CheckOptions,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<UpdatePlan> {
+    check_cancellable_with_estimates(config, opts, None, cancelled)
+}
+
+/// 与 check_cancellable 相同，但允许带上吞吐估计，
+/// 由预计完成时间决定是否保留补丁链。
+pub fn check_cancellable_with_estimates(
+    config: &GameUpdateConfig,
+    opts: CheckOptions,
+    throughput: Option<&Throughput>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<UpdatePlan> {
     if cancelled() {
         return Err(Error::Cancelled);
     }
     let bundle = load_remote(config)?;
-    check_bundle_cancellable(config, &bundle, opts, cancelled)
+    check_bundle_with_estimates(config, &bundle, opts, throughput, cancelled)
 }
 
 pub fn check_bundle(
@@ -258,10 +270,30 @@ pub fn check_bundle(
     check_bundle_cancellable(config, bundle, opts, &|| false)
 }
 
+pub fn check_bundle_with_estimates(
+    config: &GameUpdateConfig,
+    bundle: &RemoteBundle,
+    opts: CheckOptions,
+    throughput: Option<&Throughput>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<UpdatePlan> {
+    check_bundle_cancellable_with_estimates(config, bundle, opts, throughput, cancelled)
+}
+
 pub fn check_bundle_cancellable(
     config: &GameUpdateConfig,
     bundle: &RemoteBundle,
     opts: CheckOptions,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<UpdatePlan> {
+    check_bundle_cancellable_with_estimates(config, bundle, opts, None, cancelled)
+}
+
+pub fn check_bundle_cancellable_with_estimates(
+    config: &GameUpdateConfig,
+    bundle: &RemoteBundle,
+    opts: CheckOptions,
+    throughput: Option<&Throughput>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<UpdatePlan> {
     if cancelled() {
@@ -502,6 +534,7 @@ pub fn check_bundle_cancellable(
     }
 
     attach_patches(&mut plan, config, bundle, &map);
+    apply_throughput_choices(&mut plan, throughput);
     plan.items.sort_by(|a, b| a.path.cmp(&b.path));
     plan.unverified.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(plan)
@@ -538,6 +571,23 @@ fn attach_patches(
         };
         item.download_size = chain.iter().map(|patch| patch.size).sum();
         item.patches = chain;
+    }
+}
+
+/// 用吞吐估计否决预计比整包更慢的补丁链。
+///
+/// 这里只决定是否保留已经选出的最小字节链，不重新选链；跳数上限、
+/// 最后一跳版本等约束仍由 best_patch_chain 保证。
+fn apply_throughput_choices(plan: &mut UpdatePlan, throughput: Option<&Throughput>) {
+    let Some(throughput) = throughput else {
+        return;
+    };
+    for item in &mut plan.items {
+        if item.patches.is_empty() || crate::game::plan::should_use_patch(item, throughput) {
+            continue;
+        }
+        item.patches.clear();
+        item.download_size = item.size;
     }
 }
 
@@ -799,6 +849,7 @@ mod tests {
     use super::*;
     use crate::game::config::CheckRule;
     use crate::game::manifest::{BaseVersion, Package, Pak, PatchEntry};
+    use crate::game::plan::Throughput;
     use crate::testing::{HttpServer, TempDir};
     use std::io::Write as _;
     use std::path::PathBuf;
@@ -1365,6 +1416,69 @@ mod tests {
         .expect("check");
         assert_eq!(plan.items[0].reason, UpdateReason::Missing);
         assert!(plan.items[0].patches.is_empty());
+    }
+
+    #[test]
+    fn throughput_estimates_drop_patch_chains_that_are_slower() {
+        let dir = TempDir::new("check-throughput");
+        let config = config_for(&dir);
+        let old_content = vec![b'o'; 100];
+        let new_content = vec![b'n'; 200];
+        dir.write("install/data/a.bin", &old_content);
+        let old_md5 = crate::update::md5_bytes(&old_content);
+        let new_md5 = crate::update::md5_bytes(&new_content);
+        write_ledger(
+            &config,
+            &format!(
+                "<ResList version=\"1.4.16\" tag=\"baseTag\"><Res filename=\"data/a.bin\" md5=\"{old_md5}\" filesize=\"100\"/></ResList>"
+            ),
+        );
+        let patch_md5 = "ab".repeat(16);
+        let mut diff = DiffManifest {
+            sections: vec!["1.4.16".into()],
+            patches: Vec::new(),
+        };
+        diff.patches.push(PatchEntry {
+            old_file: format!("{old_md5}.100"),
+            new_file: format!("{new_md5}.200"),
+            patch: format!("{patch_md5}.50"),
+            version: "HASH".into(),
+            blocks: Vec::new(),
+        });
+        let remote = manifest_res(vec![res("data/a.bin", &new_md5, 200)]);
+        let bundle = bundle(remote, Some(diff));
+
+        // 没有吞吐估计时保持原有的按字节选择行为。
+        let plan = check_bundle(&config, &bundle, CheckOptions::default()).expect("check");
+        assert_eq!(plan.items[0].patches.len(), 1);
+
+        // 默认估计下补丁链仍然更快。
+        let plan = check_bundle_with_estimates(
+            &config,
+            &bundle,
+            CheckOptions::default(),
+            Some(&Throughput::default()),
+            &|| false,
+        )
+        .expect("check");
+        assert_eq!(plan.items[0].patches.len(), 1);
+
+        // 下载很快、应用极慢时，整包完成时间更短。
+        let slow_apply = Throughput {
+            download_bytes_per_second: 1_000_000_000.0,
+            apply_bytes_per_second: 1.0,
+            verify_bytes_per_second: 1_000_000_000.0,
+        };
+        let plan = check_bundle_with_estimates(
+            &config,
+            &bundle,
+            CheckOptions::default(),
+            Some(&slow_apply),
+            &|| false,
+        )
+        .expect("check");
+        assert!(plan.items[0].patches.is_empty());
+        assert_eq!(plan.items[0].download_size, 200);
     }
 
     #[test]

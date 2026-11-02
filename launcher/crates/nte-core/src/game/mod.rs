@@ -9,6 +9,7 @@ pub mod download;
 pub mod ledger;
 pub mod manifest;
 pub mod patch;
+pub mod plan;
 pub mod pxml;
 
 pub use check::{CheckOptions, UpdateItem, UpdateKind, UpdatePlan};

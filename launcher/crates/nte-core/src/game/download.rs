@@ -11,6 +11,7 @@ use md5::Digest as _;
 use crate::game::check::{join_install_path, PatchRef, UpdateItem, UpdateKind, UpdatePlan};
 use crate::game::config::GameUpdateConfig;
 use crate::game::manifest::{Block, PakEntry, ResEntry};
+use crate::game::plan::StageTimings;
 use crate::http::HttpClient;
 use crate::throttle::RateLimiter;
 use crate::update::md5_file_cancellable;
@@ -51,6 +52,8 @@ pub struct ApplyResult {
 pub struct ApplyReport {
     pub results: Vec<ApplyResult>,
     pub downloaded_bytes: u64,
+    /// 各阶段实测耗时, 供吞吐估计和完成时间决策使用.
+    pub timings: StageTimings,
     pub failed: usize,
     pub skipped: usize,
     pub ledger_error: Option<String>,
@@ -118,7 +121,71 @@ enum WorkerEvent {
     Finished {
         result: ApplyResult,
         cancelled: bool,
+        timings: StageTimings,
     },
+}
+
+/// 任务级下载活跃墙钟.
+///
+/// 多个 worker 和分块线程可能同时读网络; 这里统计所有读取区间的并集,
+/// 用「总网络字节 / 活跃墙钟」换算出的才是聚合吞吐, 与默认估计口径一致。
+struct DownloadClock {
+    state: Mutex<DownloadClockState>,
+}
+
+#[derive(Default)]
+struct DownloadClockState {
+    active: usize,
+    started: Option<Instant>,
+    accumulated: Duration,
+}
+
+impl DownloadClock {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(DownloadClockState::default()),
+        }
+    }
+
+    /// 标记一段网络读取开始; 返回的守卫在 drop 时结束该段.
+    fn begin(&self) -> DownloadGuard<'_> {
+        let mut state = self.lock();
+        if state.active == 0 {
+            state.started = Some(Instant::now());
+        }
+        state.active += 1;
+        DownloadGuard { clock: self }
+    }
+
+    /// 各读取区间并集的总纳秒数; 进行中的区间按当前时刻折算.
+    fn wall_nanos(&self) -> u64 {
+        let state = self.lock();
+        let mut total = state.accumulated;
+        if let Some(started) = state.started {
+            total += started.elapsed();
+        }
+        u64::try_from(total.as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, DownloadClockState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+struct DownloadGuard<'a> {
+    clock: &'a DownloadClock,
+}
+
+impl Drop for DownloadGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.clock.lock();
+        state.active -= 1;
+        if state.active == 0 {
+            if let Some(started) = state.started.take() {
+                state.accumulated += started.elapsed();
+            }
+        }
+    }
 }
 
 struct Progress<'a> {
@@ -126,7 +193,16 @@ struct Progress<'a> {
     index: usize,
     cancelled: &'a (dyn Fn() -> bool + Send + Sync),
     limiter: &'a RateLimiter,
+    download_clock: &'a DownloadClock,
     bytes: AtomicU64,
+    // 各阶段的真实字节与耗时; 分块线程共用同一份, 用原子量累计.
+    download_bytes: AtomicU64,
+    apply_bytes: AtomicU64,
+    apply_nanos: AtomicU64,
+    verify_bytes: AtomicU64,
+    verify_nanos: AtomicU64,
+    install_bytes: AtomicU64,
+    install_nanos: AtomicU64,
 }
 
 impl Progress<'_> {
@@ -135,13 +211,22 @@ impl Progress<'_> {
         index: usize,
         cancelled: &'a (dyn Fn() -> bool + Send + Sync),
         limiter: &'a RateLimiter,
+        download_clock: &'a DownloadClock,
     ) -> Progress<'a> {
         Progress {
             tx,
             index,
             cancelled,
             limiter,
+            download_clock,
             bytes: AtomicU64::new(0),
+            download_bytes: AtomicU64::new(0),
+            apply_bytes: AtomicU64::new(0),
+            apply_nanos: AtomicU64::new(0),
+            verify_bytes: AtomicU64::new(0),
+            verify_nanos: AtomicU64::new(0),
+            install_bytes: AtomicU64::new(0),
+            install_nanos: AtomicU64::new(0),
         }
     }
 
@@ -176,6 +261,51 @@ impl Progress<'_> {
     fn cancelled(&self) -> bool {
         (self.cancelled)()
     }
+
+    /// 标记一段真实网络读取; 返回的守卫在离开作用域时结束计时.
+    fn begin_download(&self) -> DownloadGuard<'_> {
+        self.download_clock.begin()
+    }
+
+    /// 网络耗时由任务级 DownloadClock 统一统计, 这里只累计真实字节.
+    fn add_download(&self, bytes: u64) {
+        self.download_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn add_apply(&self, bytes: u64, elapsed: Duration) {
+        record_stage(&self.apply_bytes, &self.apply_nanos, bytes, elapsed);
+    }
+
+    fn add_verify(&self, bytes: u64, elapsed: Duration) {
+        record_stage(&self.verify_bytes, &self.verify_nanos, bytes, elapsed);
+    }
+
+    fn add_install(&self, bytes: u64, elapsed: Duration) {
+        record_stage(&self.install_bytes, &self.install_nanos, bytes, elapsed);
+    }
+
+    fn timings(&self) -> StageTimings {
+        StageTimings {
+            download_bytes: self.download_bytes.load(Ordering::Relaxed),
+            // 下载耗时由任务级 DownloadClock 在汇总时覆盖, 单项汇总先留空.
+            download_nanos: 0,
+            apply_bytes: self.apply_bytes.load(Ordering::Relaxed),
+            apply_nanos: self.apply_nanos.load(Ordering::Relaxed),
+            verify_bytes: self.verify_bytes.load(Ordering::Relaxed),
+            verify_nanos: self.verify_nanos.load(Ordering::Relaxed),
+            install_bytes: self.install_bytes.load(Ordering::Relaxed),
+            install_nanos: self.install_nanos.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// 累计一个阶段的字节与耗时; 纳秒饱和到 u64, 避免极端时钟溢出.
+fn record_stage(bytes: &AtomicU64, nanos: &AtomicU64, amount: u64, elapsed: Duration) {
+    bytes.fetch_add(amount, Ordering::Relaxed);
+    nanos.fetch_add(
+        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
 }
 
 enum Prepared {
@@ -259,6 +389,8 @@ pub fn apply_plan_observed_full(
         .collect();
 
     let mut report = ApplyReport::default();
+    // 并发下载的耗时按任务级活跃墙钟统计, 与默认估计的聚合吞吐口径一致.
+    let download_clock = DownloadClock::new();
     if !plan.unverified.is_empty() {
         report.failed = plan.unverified.len();
         report.results = plan
@@ -272,7 +404,7 @@ pub fn apply_plan_observed_full(
                 skipped: false,
             })
             .collect();
-        return report;
+        return finish_timings(report, &download_clock);
     }
     if !opts.dry_run {
         let storage_paths = [
@@ -291,7 +423,7 @@ pub fn apply_plan_observed_full(
             if let Err(error) = valid {
                 report.failed = 1;
                 report.ledger_error = Some(error.to_string());
-                return report;
+                return finish_timings(report, &download_clock);
             }
         }
     }
@@ -312,7 +444,7 @@ pub fn apply_plan_observed_full(
                 report.ledger_error = Some(error.to_string());
             }
         }
-        return report;
+        return finish_timings(report, &download_clock);
     }
 
     if opts.dry_run {
@@ -327,7 +459,7 @@ pub fn apply_plan_observed_full(
             });
             report.skipped += 1;
         }
-        return report;
+        return finish_timings(report, &download_clock);
     }
 
     cleanup_stale_parts(&staging, plan);
@@ -371,6 +503,7 @@ pub fn apply_plan_observed_full(
     let next = &next;
     let http = &http;
     let limiter = &limiter;
+    let download_clock = &download_clock;
     let mut completed: Vec<String> = Vec::new();
     let mut report = std::thread::scope(|scope| {
         for tx in worker_txs.drain(..) {
@@ -386,6 +519,7 @@ pub fn apply_plan_observed_full(
                     next,
                     &tx,
                     limiter,
+                    download_clock,
                     cancelled,
                     allow_ranges,
                 );
@@ -405,7 +539,9 @@ pub fn apply_plan_observed_full(
                 WorkerEvent::Finished {
                     result,
                     cancelled: was_cancelled,
+                    timings,
                 } => {
+                    report.timings.add(&timings);
                     if was_cancelled {
                         report.cancelled = true;
                     } else if result.ok && !result.skipped {
@@ -427,6 +563,8 @@ pub fn apply_plan_observed_full(
         }
         report
     });
+    // 各 worker 只累计了下载字节, 这里统一写入任务级活跃墙钟.
+    report.timings.download_nanos = download_clock.wall_nanos();
 
     report.results.sort_by(|a, b| a.path.cmp(&b.path));
     report.cancelled |= cancelled();
@@ -438,6 +576,12 @@ pub fn apply_plan_observed_full(
             Err(error) => report.ledger_error = Some(error.to_string()),
         }
     }
+    report
+}
+
+/// 用任务级下载墙钟收尾报告; 没开始过任何下载时保持 0.
+fn finish_timings(mut report: ApplyReport, download_clock: &DownloadClock) -> ApplyReport {
+    report.timings.download_nanos = download_clock.wall_nanos();
     report
 }
 
@@ -453,6 +597,7 @@ fn worker_loop(
     next: &AtomicUsize,
     tx: &Sender<WorkerEvent>,
     limiter: &RateLimiter,
+    download_clock: &DownloadClock,
     cancelled: &(dyn Fn() -> bool + Send + Sync),
     allow_ranges: bool,
 ) {
@@ -464,9 +609,9 @@ fn worker_loop(
         if index >= selected.len() {
             return;
         }
-        let progress = Progress::new(tx, index, cancelled, limiter);
+        let progress = Progress::new(tx, index, cancelled, limiter, download_clock);
         let _ = tx.send(WorkerEvent::Started { index });
-        let (result, was_cancelled) = process_item(
+        let (result, was_cancelled, timings) = process_item(
             config,
             plan,
             opts,
@@ -480,6 +625,7 @@ fn worker_loop(
         let _ = tx.send(WorkerEvent::Finished {
             result,
             cancelled: was_cancelled,
+            timings,
         });
         if was_cancelled {
             return;
@@ -498,7 +644,7 @@ fn process_item(
     install_lock: &Mutex<()>,
     progress: &Progress<'_>,
     allow_ranges: bool,
-) -> (ApplyResult, bool) {
+) -> (ApplyResult, bool, StageTimings) {
     let target = join_install_path(&config.install_root, &item.path);
     let outcome = run_item(
         config,
@@ -525,6 +671,7 @@ fn process_item(
             skipped: false,
         },
         cancelled,
+        progress.timings(),
     )
 }
 
@@ -568,7 +715,7 @@ fn run_item(
                     return Err(Error::Cancelled);
                 }
                 check_paths()?;
-                install_temp(&temp, target, &|| progress.cancelled())
+                install_observed(progress, &temp, target, item.size)
             });
             if installed.is_ok() {
                 remove_patch_temps(staging, item);
@@ -584,15 +731,14 @@ fn run_item(
                 progress.stage(ApplyStage::Patch);
                 let final_path = apply_patch_chain(item, target, staging, &patches, progress)?;
                 progress.stage(ApplyStage::Verify);
-                if !verify_cancellable(&final_path, item.size, &item.md5, &|| progress.cancelled())?
-                {
+                if !verify_observed(progress, &final_path, item.size, &item.md5)? {
                     return Err(Error::Integrity(format!(
                         "patched output mismatch for {}",
                         target.display()
                     )));
                 }
                 progress.stage(ApplyStage::Install);
-                install_temp(&final_path, target, &|| progress.cancelled())
+                install_observed(progress, &final_path, target, item.size)
             });
             match applied {
                 Ok(()) => {
@@ -612,7 +758,7 @@ fn run_item(
                             return Err(Error::Cancelled);
                         }
                         check_paths()?;
-                        install_temp(&temp, target, &|| progress.cancelled())
+                        install_observed(progress, &temp, target, item.size)
                     });
                     if installed.is_ok() {
                         remove_patch_temps(staging, item);
@@ -651,8 +797,7 @@ fn prepare_item(
 
     if !item.patches.is_empty() && target.is_file() {
         if let Some(final_temp) = chain_final_temp(staging, item) {
-            if final_temp.is_file()
-                && verify_cancellable(&final_temp, item.size, &item.md5, &|| progress.cancelled())?
+            if final_temp.is_file() && verify_observed(progress, &final_temp, item.size, &item.md5)?
             {
                 // 完整补丁产物是之前下载并应用补丁的结果, 计入本轮已下载量.
                 progress.add(item.download_size);
@@ -846,7 +991,9 @@ fn apply_patch_chain(
         if out.exists() {
             fs::remove_file(&out)?;
         }
+        let started = Instant::now();
         crate::game::patch::apply_hdiff(&current, patch_path, &out)?;
+        progress.add_apply(patch.new_size, started.elapsed());
         if current_is_temp {
             fs::remove_file(&current).ok();
         }
@@ -924,7 +1071,7 @@ fn download_to_temp(
     if temp.is_file() {
         let length = fs::metadata(temp)?.len();
         if length == expected_size {
-            if verify_cancellable(temp, expected_size, expected_md5, &|| progress.cancelled())? {
+            if verify_observed(progress, temp, expected_size, expected_md5)? {
                 fs::remove_file(range_index_path(temp)).ok();
                 progress.add(length);
                 return Ok(0);
@@ -976,9 +1123,7 @@ fn download_to_temp(
             }
             let existing = temp.metadata().map(|meta| meta.len()).unwrap_or(0);
             match fetch_to_file(http, &attempt_url, temp, existing, expected_size, progress) {
-                Ok(bytes) => match verify_cancellable(temp, expected_size, expected_md5, &|| {
-                    progress.cancelled()
-                }) {
+                Ok(bytes) => match verify_observed(progress, temp, expected_size, expected_md5) {
                     Ok(true) => {
                         // 服务端忽略 Range 时会从头覆盖文件, 此时旧前缀不再计入.
                         if resumed > 0 && resumed.saturating_add(bytes) <= expected_size {
@@ -1041,7 +1186,7 @@ fn download_range_to_temp(
     if temp.is_file() {
         let length = fs::metadata(temp)?.len();
         if length == size {
-            if verify_cancellable(temp, size, expected_md5, &|| progress.cancelled())? {
+            if verify_observed(progress, temp, size, expected_md5)? {
                 return Ok(0);
             }
             fs::remove_file(temp)?;
@@ -1077,23 +1222,21 @@ fn download_range_to_temp(
                 size.saturating_sub(existing),
                 progress,
             ) {
-                Ok(bytes) => {
-                    match verify_cancellable(temp, size, expected_md5, &|| progress.cancelled()) {
-                        Ok(true) => return Ok(bytes),
-                        Ok(false) => {
-                            fs::remove_file(temp).ok();
-                            last_error = Some(Error::Integrity(format!(
-                                "PatcherPak entry md5 mismatch for {}",
-                                temp.display()
-                            )));
-                            break;
-                        }
-                        Err(error) => {
-                            last_error = Some(error);
-                            break;
-                        }
+                Ok(bytes) => match verify_observed(progress, temp, size, expected_md5) {
+                    Ok(true) => return Ok(bytes),
+                    Ok(false) => {
+                        fs::remove_file(temp).ok();
+                        last_error = Some(Error::Integrity(format!(
+                            "PatcherPak entry md5 mismatch for {}",
+                            temp.display()
+                        )));
+                        break;
                     }
-                }
+                    Err(error) => {
+                        last_error = Some(error);
+                        break;
+                    }
+                },
                 Err(Error::Cancelled) => return Err(Error::Cancelled),
                 Err(error @ Error::Unsupported(_)) => {
                     last_error = Some(error);
@@ -1243,7 +1386,7 @@ fn download_ranges(
     if progress.cancelled() {
         return Err(Error::Cancelled);
     }
-    if !verify_cancellable(temp, expected_size, expected_md5, &|| progress.cancelled())? {
+    if !verify_observed(progress, temp, expected_size, expected_md5)? {
         fs::remove_file(temp).ok();
         fs::remove_file(index_path).ok();
         return Err(Error::Integrity(format!(
@@ -1388,6 +1531,8 @@ fn fetch_to_file(
     let mut reader = response.body_mut().as_reader();
     let mut buffer = vec![0u8; NETWORK_BUFFER];
     let mut total = 0u64;
+    // 只统计本次真正从网络读取的字节; 续传前缀由调用方另行计入进度.
+    let _download = progress.begin_download();
     loop {
         if progress.cancelled() {
             output.flush()?;
@@ -1408,6 +1553,7 @@ fn fetch_to_file(
     if status != 200 && status != 206 {
         return Err(Error::Http(format!("GET {url}: HTTP {status}")));
     }
+    progress.add_download(total);
     Ok(total)
 }
 
@@ -1434,6 +1580,8 @@ fn fetch_range_to_file(
     let mut reader = response.body_mut().as_reader();
     let mut buffer = vec![0u8; NETWORK_BUFFER];
     let mut written = 0u64;
+    // 读取区间进入任务级活跃墙钟; 并发块的重叠时间只算一次.
+    let _download = progress.begin_download();
     loop {
         if progress.cancelled() {
             return Err(Error::Cancelled);
@@ -1449,6 +1597,7 @@ fn fetch_range_to_file(
         written += read as u64;
         progress.add(read as u64);
     }
+    progress.add_download(written);
     Ok(written)
 }
 
@@ -1686,6 +1835,22 @@ fn verify_cancellable(
     Ok(got.eq_ignore_ascii_case(expected_md5))
 }
 
+/// 带进度上下文的校验; 只有完整通过才计入耗时和字节, 避免把提前
+/// 返回的尺寸不符或取消算成校验吞吐.
+fn verify_observed(
+    progress: &Progress<'_>,
+    path: &Path,
+    expected_size: u64,
+    expected_md5: &str,
+) -> Result<bool> {
+    let started = Instant::now();
+    let ok = verify_cancellable(path, expected_size, expected_md5, &|| progress.cancelled())?;
+    if ok {
+        progress.add_verify(expected_size, started.elapsed());
+    }
+    Ok(ok)
+}
+
 fn install_temp(temp: &Path, target: &Path, cancelled: &dyn Fn() -> bool) -> Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
@@ -1706,6 +1871,14 @@ fn install_temp(temp: &Path, target: &Path, cancelled: &dyn Fn() -> bool) -> Res
     }
     adjacent.commit(target, cancelled)?;
     fs::remove_file(temp).ok();
+    Ok(())
+}
+
+/// 安装阶段只在成功后记录耗时, 失败或取消的尝试不计入吞吐样本.
+fn install_observed(progress: &Progress<'_>, temp: &Path, target: &Path, size: u64) -> Result<()> {
+    let started = Instant::now();
+    install_temp(temp, target, &|| progress.cancelled())?;
+    progress.add_install(size, started.elapsed());
     Ok(())
 }
 
@@ -1938,6 +2111,7 @@ mod tests {
         );
         assert!(report.cancelled);
         assert!(report.results.is_empty());
+        assert!(report.timings.is_empty());
         assert!(!config.install_root.join("data/a.bin").exists());
         assert!(!config.patcher_dir.join("ResList.xml").exists());
     }
@@ -1993,6 +2167,15 @@ mod tests {
         assert!(!report.results[0].skipped);
         assert_eq!(report.downloaded_bytes, content.len() as u64);
         assert_eq!(dir.read("install/data/a.bin"), content);
+        // 整包路径只有下载、校验、安装三个阶段有真实耗时.
+        assert!(report.timings.download_bytes > 0);
+        assert!(report.timings.download_nanos > 0);
+        assert!(report.timings.verify_bytes > 0);
+        assert!(report.timings.verify_nanos > 0);
+        assert!(report.timings.install_bytes > 0);
+        assert!(report.timings.install_nanos > 0);
+        assert_eq!(report.timings.apply_bytes, 0);
+        assert_eq!(report.timings.apply_nanos, 0);
 
         let ledger = crate::game::check::load_local_ledger(&config)
             .expect("load ledger")
@@ -2086,6 +2269,8 @@ mod tests {
             .as_deref()
             .expect("error text")
             .contains("404"));
+        // 请求在读取响应体前就失败, 不应产生任何阶段耗时.
+        assert!(report.timings.is_empty());
         assert!(report.ledger_error.is_none());
         assert!(!config.patcher_dir.join("ResList.xml").exists());
     }
@@ -2114,6 +2299,11 @@ mod tests {
         assert_eq!(report.downloaded_bytes, content.len() as u64);
         assert_eq!(server.hits(&path), 0);
         assert_eq!(dir.read("install/data/a.bin"), content);
+        // 复用已有文件不产生下载耗时, 但仍要计入校验和安装.
+        assert_eq!(report.timings.download_bytes, 0);
+        assert_eq!(report.timings.download_nanos, 0);
+        assert!(report.timings.verify_bytes > 0);
+        assert!(report.timings.install_bytes > 0);
     }
 
     #[test]
@@ -2387,6 +2577,10 @@ mod tests {
             .expect("error text")
             .contains("download md5 mismatch"));
         assert!(!dir.is_file("install/data/a.bin"));
+        // 下载成功但校验失败: 下载字节有记录, 未通过的校验不计入耗时.
+        assert!(report.timings.download_bytes > 0);
+        assert_eq!(report.timings.verify_bytes, 0);
+        assert_eq!(report.timings.install_bytes, 0);
     }
 
     #[test]
@@ -2414,6 +2608,10 @@ mod tests {
         );
         assert!(report.results[0].ok, "{:?}", report.results[0].error);
         assert_eq!(report.downloaded_bytes, entry_bytes.len() as u64);
+        // 区间下载只统计卷内条目的字节.
+        assert_eq!(report.timings.download_bytes, entry_bytes.len() as u64);
+        assert_eq!(report.timings.verify_bytes, entry_bytes.len() as u64);
+        assert_eq!(report.timings.install_bytes, entry_bytes.len() as u64);
         assert_eq!(
             dir.read("install/Client/Content/Paks/pakchunk0.pak"),
             entry_bytes
@@ -2485,6 +2683,12 @@ mod tests {
         assert!(report.results[0].ok, "{:?}", report.results[0].error);
         assert_eq!(dir.read("install/data/a.bin"), new_content);
         assert_eq!(report.downloaded_bytes, patch_bytes.len() as u64);
+        // 单跳补丁的应用字节就是最终产物大小, 下载耗时只覆盖补丁字节.
+        assert_eq!(report.timings.apply_bytes, new_content.len() as u64);
+        assert!(report.timings.apply_nanos > 0);
+        assert!(report.timings.download_bytes >= patch_bytes.len() as u64);
+        assert!(report.timings.verify_bytes > 0);
+        assert!(report.timings.install_bytes > 0);
     }
 
     #[test]
@@ -2598,6 +2802,12 @@ mod tests {
             report.downloaded_bytes,
             (mid_patch.len() + final_patch.len()) as u64
         );
+        // 多跳时应用字节按各跳产物累计, 不是最终文件大小.
+        assert_eq!(
+            report.timings.apply_bytes,
+            (mid_content.len() + new_content.len()) as u64
+        );
+        assert!(report.timings.download_bytes >= (mid_patch.len() + final_patch.len()) as u64);
     }
 
     #[test]
@@ -2630,6 +2840,10 @@ mod tests {
         assert_eq!(dir.read("install/data/a.bin"), content);
         // 已完成的块与本次下载的块一起计入进度.
         assert_eq!(report.downloaded_bytes, content.len() as u64);
+        // 已完成的块来自上一次任务, 不计入本次下载耗时; 校验仍覆盖整个文件.
+        assert!(report.timings.download_bytes > 0);
+        assert!(report.timings.download_bytes < content.len() as u64);
+        assert_eq!(report.timings.verify_bytes, content.len() as u64);
         let ranges = server.ranges();
         assert_eq!(ranges.len(), 3, "{ranges:?}");
         assert!(!ranges.iter().any(|range| range.starts_with("bytes=0-")));
@@ -2659,10 +2873,21 @@ mod tests {
             });
         }
 
+        let task_started = Instant::now();
         let report = apply_plan(&config, &plan_of(vec![item]), &ApplyOptions::default());
+        let task_elapsed = task_started.elapsed();
         assert!(report.results[0].ok, "{:?}", report.results[0].error);
         assert_eq!(dir.read("install/data/a.bin"), content);
         assert_eq!(report.downloaded_bytes, content.len() as u64);
+        // 所有块都是本次下载, 校验覆盖整个文件.
+        assert_eq!(report.timings.download_bytes, content.len() as u64);
+        assert_eq!(report.timings.verify_bytes, content.len() as u64);
+        // 下载耗时是任务级活跃墙钟, 不会超过整个任务的实际墙钟.
+        assert!(report.timings.download_nanos > 0);
+        assert!(
+            report.timings.download_nanos
+                <= u64::try_from(task_elapsed.as_nanos()).unwrap_or(u64::MAX)
+        );
         assert_eq!(server.ranges().len(), 4, "{:?}", server.ranges());
     }
 
@@ -2711,6 +2936,68 @@ mod tests {
     }
 
     #[test]
+    fn download_clock_counts_overlapping_reads_once() {
+        let clock = DownloadClock::new();
+        let barrier = std::sync::Barrier::new(3);
+        let held: Vec<Duration> = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..2 {
+                let clock = &clock;
+                let barrier = &barrier;
+                workers.push(scope.spawn(move || {
+                    barrier.wait();
+                    let started = Instant::now();
+                    let _guard = clock.begin();
+                    std::thread::sleep(Duration::from_millis(100));
+                    started.elapsed()
+                }));
+            }
+            barrier.wait();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("join download clock worker"))
+                .collect()
+        });
+        let wall = clock.wall_nanos();
+        let sum: u64 = held
+            .iter()
+            .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+            .sum();
+        // 两段读取几乎完全重叠: 活跃墙钟接近单段, 明显小于两段之和.
+        assert!(wall >= Duration::from_millis(100).as_nanos() as u64);
+        assert!(wall * 2 < sum * 3 / 2, "wall={wall} sum={sum}");
+        // 所有守卫结束后墙钟不再增长.
+        let settled = clock.wall_nanos();
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(clock.wall_nanos(), settled);
+    }
+
+    #[test]
+    fn progress_accumulates_stage_timings_for_the_worker_report() {
+        let (tx, _rx) = mpsc::channel();
+        let cancelled = || false;
+        let limiter = RateLimiter::new(0);
+        let clock = DownloadClock::new();
+        let progress = Progress::new(&tx, 0, &cancelled, &limiter, &clock);
+
+        progress.add_download(100);
+        progress.add_apply(200, Duration::from_millis(3));
+        progress.add_verify(300, Duration::from_millis(4));
+        progress.add_install(400, Duration::from_millis(5));
+
+        let timings = progress.timings();
+        assert_eq!(timings.download_bytes, 100);
+        // 下载耗时由任务级时钟在汇总时写入, 单项汇总不重复累计.
+        assert_eq!(timings.download_nanos, 0);
+        assert_eq!(timings.apply_bytes, 200);
+        assert_eq!(timings.apply_nanos, 3_000_000);
+        assert_eq!(timings.verify_bytes, 300);
+        assert_eq!(timings.verify_nanos, 4_000_000);
+        assert_eq!(timings.install_bytes, 400);
+        assert_eq!(timings.install_nanos, 5_000_000);
+    }
+
+    #[test]
     fn multiple_items_are_downloaded_and_installed() {
         let dir = TempDir::new("dl-parallel");
         let server = HttpServer::start();
@@ -2733,6 +3020,9 @@ mod tests {
         for (path, content) in expected {
             assert_eq!(dir.read(format!("install/{path}")), content);
         }
+        // 多文件并行时各阶段字节汇总到同一份报告; 每个 payload 18 字节.
+        assert_eq!(report.timings.download_bytes, 4 * 18);
+        assert_eq!(report.timings.install_bytes, 4 * 18);
     }
 
     #[test]
@@ -2774,6 +3064,10 @@ mod tests {
         assert_eq!(dir.read("install/data/a.bin"), old);
         assert!(!config.patcher_dir.join("ResList.xml").exists());
         assert_eq!(server.targets().len(), 1);
+        // 取消发生在校验阶段, 已完成的下载和应用耗时仍如实记录.
+        assert!(report.timings.download_bytes > 0);
+        assert!(report.timings.apply_bytes > 0);
+        assert_eq!(report.timings.install_bytes, 0);
 
         // 再次执行直接复用完整补丁产物, 不计入新的网络请求.
         let report = apply_plan(&config, &plan, &ApplyOptions::default());
